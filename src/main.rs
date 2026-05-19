@@ -787,4 +787,21 @@ mod tests {
             "old media"
         );
     }
+
+    #[test]
+    fn backup_creates_nested_local_storage_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let volumes_root = temp.path().join("volumes");
+        let backups_root = temp.path().join("missing").join("nested").join("backups");
+        let app_volume = volumes_root.join("app");
+
+        fs::create_dir_all(&app_volume).unwrap();
+        fs::write(app_volume.join("state.txt"), "app data").unwrap();
+
+        let mut storage = LocalStorage::new(backups_root.clone());
+        backup_volume(&volumes_root, &mut storage, "app").unwrap();
+
+        assert_eq!(storage.list("app").unwrap().len(), 1);
+        assert!(backups_root.join("app").is_dir());
+    }
 }

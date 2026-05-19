@@ -18,6 +18,8 @@ Storage is selected with `STORAGE_DRIVER`.
 
 SFTP backups stream the tar.xz encoder directly into the remote SFTP file. The archive is not created on local disk first.
 
+Both storage drivers create missing destination directories recursively when writing archives, including per-volume directories.
+
 ## Commands
 
 ```text
