@@ -19,12 +19,12 @@ RUN set -eux; \
   esac; \
   rustup target add "$rust_target"; \
   cargo build --locked --release --target "$rust_target"; \
-  cp "target/$rust_target/release/fileserver-backup" /fileserver-backup
+  cp "target/$rust_target/release/docker-volume-backups" /docker-volume-backups
 
 FROM scratch
 
-COPY --from=builder /fileserver-backup /fileserver-backup
+COPY --from=builder /docker-volume-backups /docker-volume-backups
 
 USER 65532:65532
-ENTRYPOINT ["/fileserver-backup"]
-CMD ["run"]
+ENTRYPOINT ["/docker-volume-backups"]
+CMD ["schedule"]

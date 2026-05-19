@@ -10,8 +10,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use chrono::{DateTime, Local, Utc};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use cron::Schedule;
 use filetime::FileTime;
 use log::{info, warn};
@@ -29,7 +29,7 @@ const DEFAULT_SFTP_PRIVATE_KEY_FILE: &str = "/run/secrets/SFTP_PRIVATE_KEY";
 const DEFAULT_SFTP_PRIVATE_KEY_PASSPHRASE_FILE: &str = "/run/secrets/SFTP_PRIVATE_KEY_PASSPHRASE";
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(author, version, about, subcommand_required = true)]
 struct Cli {
     #[arg(long, env = "VOLUMES_ROOT", default_value = DEFAULT_VOLUMES_ROOT)]
     volumes_root: PathBuf,
@@ -94,11 +94,8 @@ struct Cli {
     )]
     retention_max_total_size: u64,
 
-    #[arg(long, env = "BACKUP_CRON", default_value = DEFAULT_BACKUP_CRON)]
-    backup_cron: String,
-
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -115,21 +112,30 @@ enum RetentionPolicyKind {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Backup {
-        volume: String,
-    },
+    /// Back up one volume.
+    Backup { volume: String },
+    /// Restore one volume, defaulting to the newest archive.
     Restore {
         volume: String,
         #[arg(long)]
         archive: Option<String>,
     },
+    /// Restore every subdirectory under `VOLUMES_ROOT`.
     RestoreAll {
         #[arg(long)]
         archive: Option<String>,
     },
+    /// Back up every subdirectory under `VOLUMES_ROOT`.
     BackupAll,
+    /// Apply retention policy to every discovered volume.
     Cleanup,
-    Run,
+    /// Run the cron scheduler.
+    #[command(alias = "run")]
+    Schedule {
+        /// Cron expression for scheduled backup runs.
+        #[arg(long = "backup-cron", env = "BACKUP_CRON", default_value = DEFAULT_BACKUP_CRON)]
+        backup_cron: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +274,7 @@ impl SftpStorage {
             bail!("SSH authentication did not complete");
         }
 
+        info!("connected to SFTP {host}:{port} as {username}, root {root}");
         let sftp = session.sftp().context("failed to open SFTP subsystem")?;
         Ok(Self { sftp, root })
     }
@@ -305,7 +312,7 @@ impl Storage for SftpStorage {
         let dir = self.path(volume, None);
         let entries = match self.sftp.readdir(Path::new(&dir)) {
             Ok(entries) => entries,
-            Err(error) if error.code() == ssh2::ErrorCode::Session(-16) => return Ok(Vec::new()),
+            Err(error) if is_missing_remote_entry(&error) => return Ok(Vec::new()),
             Err(error) => return Err(error).with_context(|| format!("failed to list {dir}")),
         };
 
@@ -335,16 +342,24 @@ impl Storage for SftpStorage {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if env::args_os().len() == 1 {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     validate_config(&cli)?;
 
-    match cli.command.as_ref().unwrap_or(&Command::Run) {
+    match &cli.command {
         Command::Backup { volume } => {
+            info!("executing backup command for volume {volume}");
             let mut storage = build_storage(&cli)?;
             backup_volume(&cli.volumes_root, storage.as_mut(), volume)?;
         }
         Command::Restore { volume, archive } => {
+            info!("executing restore command for volume {volume}");
             let mut storage = build_storage(&cli)?;
             restore_volume(
                 &cli.volumes_root,
@@ -354,18 +369,24 @@ fn main() -> Result<()> {
             )?;
         }
         Command::RestoreAll { archive } => {
+            info!("executing restore-all command");
             let mut storage = build_storage(&cli)?;
             restore_all(&cli.volumes_root, storage.as_mut(), archive.as_deref())?;
         }
         Command::BackupAll => {
+            info!("executing backup-all command");
             let mut storage = build_storage(&cli)?;
             backup_all(&cli.volumes_root, storage.as_mut())?;
         }
         Command::Cleanup => {
+            info!("executing cleanup command");
             let mut storage = build_storage(&cli)?;
             cleanup_all(&cli.volumes_root, storage.as_mut(), &retention_policy(&cli))?;
         }
-        Command::Run => run_scheduler(&cli)?,
+        Command::Schedule { backup_cron } => {
+            info!("executing schedule command");
+            run_scheduler(&cli, backup_cron)?;
+        }
     }
 
     Ok(())
@@ -387,7 +408,6 @@ fn validate_config(config: &Cli) -> Result<()> {
     if config.retention_min_count == 0 {
         bail!("RETENTION_MIN_COUNT must be greater than 0");
     }
-    parse_schedule(&config.backup_cron)?;
     Ok(())
 }
 
@@ -399,7 +419,10 @@ fn backup_volume(volumes_root: &Path, storage: &mut dyn Storage, volume: &str) -
     }
 
     let archive = format!("{}.tar.xz", Utc::now().format("%Y-%m-%dT%H-%M-%SZ"));
-    info!("backing up {volume} to {archive}");
+    info!(
+        "backing up volume {volume} from {} to archive {archive}",
+        source.display()
+    );
     let writer = storage.put(volume, &archive)?;
     let encoder = XzEncoder::new(writer, 6);
     let mut tar = Builder::new(encoder);
@@ -433,8 +456,15 @@ fn restore_volume(
 }
 
 fn backup_all(volumes_root: &Path, storage: &mut dyn Storage) -> Result<()> {
-    for volume in discover_volumes(volumes_root)? {
-        backup_volume(volumes_root, storage, &volume)?;
+    let volumes = discover_volumes(volumes_root)?;
+    info!("backing up {} volume(s)", volumes.len());
+    for (index, volume) in volumes.iter().enumerate() {
+        info!(
+            "backing up volume {volume} ({}/{})",
+            index + 1,
+            volumes.len()
+        );
+        backup_volume(volumes_root, storage, volume)?;
     }
     Ok(())
 }
@@ -444,8 +474,15 @@ fn restore_all(
     storage: &mut dyn Storage,
     archive: Option<&str>,
 ) -> Result<()> {
-    for volume in discover_volumes(volumes_root)? {
-        restore_volume(volumes_root, storage, &volume, archive)?;
+    let volumes = discover_volumes(volumes_root)?;
+    info!("restoring {} volume(s)", volumes.len());
+    for (index, volume) in volumes.iter().enumerate() {
+        info!(
+            "restoring volume {volume} ({}/{})",
+            index + 1,
+            volumes.len()
+        );
+        restore_volume(volumes_root, storage, volume, archive)?;
     }
     Ok(())
 }
@@ -455,8 +492,15 @@ fn cleanup_all(
     storage: &mut dyn Storage,
     policy: &RetentionPolicy,
 ) -> Result<()> {
-    for volume in discover_volumes(volumes_root)? {
-        cleanup_volume(storage, &volume, policy)?;
+    let volumes = discover_volumes(volumes_root)?;
+    info!("cleaning up {} volume(s)", volumes.len());
+    for (index, volume) in volumes.iter().enumerate() {
+        info!(
+            "cleaning up volume {volume} ({}/{})",
+            index + 1,
+            volumes.len()
+        );
+        cleanup_volume(storage, volume, policy)?;
     }
     Ok(())
 }
@@ -474,6 +518,13 @@ fn cleanup_volume(storage: &mut dyn Storage, volume: &str, policy: &RetentionPol
             max_total_size,
         } => archives_to_remove_for_size(&archives, min_count, max_total_size),
     };
+    let keep_count = archives.len().saturating_sub(to_remove.len());
+    info!(
+        "cleanup for volume {volume}: found {} archive(s), removing {}, leaving {}",
+        archives.len(),
+        to_remove.len(),
+        keep_count
+    );
 
     for archive in to_remove {
         info!("removing {volume}/{archive}");
@@ -482,24 +533,15 @@ fn cleanup_volume(storage: &mut dyn Storage, volume: &str, policy: &RetentionPol
     Ok(())
 }
 
-fn run_scheduler(config: &Cli) -> Result<()> {
-    let schedule = parse_schedule(&config.backup_cron)?;
-    info!(
-        "scheduler started with cron expression {}",
-        config.backup_cron
-    );
+fn run_scheduler(config: &Cli, backup_cron: &str) -> Result<()> {
+    let schedule = parse_schedule(backup_cron)?;
+    info!("cron scheduler started");
+    info!("cron expression: {backup_cron}");
+    let mut next = next_scheduled_run(&schedule)?;
+    info!("next backup run at {next}");
 
     loop {
-        let now = Local::now();
-        let next = schedule
-            .after(&now)
-            .next()
-            .context("cron expression produced no future run")?;
-        let sleep_for = next.signed_duration_since(now).to_std().with_context(|| {
-            format!("failed to calculate sleep duration until scheduled run {next}")
-        })?;
-        info!("next backup run at {next}");
-        sleep_until(sleep_for);
+        sleep_until_run(next);
 
         let result = (|| -> Result<()> {
             let mut storage = build_storage(config)?;
@@ -511,9 +553,13 @@ fn run_scheduler(config: &Cli) -> Result<()> {
             )
         })();
 
-        if let Err(error) = result {
-            warn!("scheduled backup failed: {error:#}");
+        match result {
+            Ok(()) => info!("scheduled backup completed"),
+            Err(error) => warn!("scheduled backup failed: {error:#}"),
         }
+
+        next = next_scheduled_run(&schedule)?;
+        info!("next backup run at {next}");
     }
 }
 
@@ -624,6 +670,22 @@ fn parse_schedule(expression: &str) -> Result<Schedule> {
         .with_context(|| format!("failed to parse cron expression {expression:?}"))
 }
 
+fn next_scheduled_run(schedule: &Schedule) -> Result<DateTime<Local>> {
+    let now = Local::now();
+    schedule
+        .after(&now)
+        .next()
+        .context("cron expression produced no future run")
+}
+
+fn sleep_until_run(next: DateTime<Local>) {
+    let sleep_for = next
+        .signed_duration_since(Local::now())
+        .to_std()
+        .unwrap_or_default();
+    sleep_until(sleep_for);
+}
+
 fn sleep_until(duration: Duration) {
     thread::sleep(duration);
 }
@@ -688,13 +750,33 @@ fn create_remote_dir_all(sftp: &Sftp, path: &str) -> Result<()> {
     for part in path.split('/').filter(|part| !part.is_empty()) {
         current.push('/');
         current.push_str(part);
-        match sftp.mkdir(Path::new(&current), 0o755) {
-            Ok(()) => {}
-            Err(error) if error.code() == ssh2::ErrorCode::Session(-31) => {}
-            Err(error) => return Err(error).with_context(|| format!("failed to create {current}")),
+
+        match sftp.stat(Path::new(&current)) {
+            Ok(stat) if stat.file_type().is_dir() => {}
+            Ok(_) => bail!("{current} exists but is not a directory"),
+            Err(error) if is_missing_remote_entry(&error) => {
+                info!("creating remote directory {current}");
+                if let Err(error) = sftp.mkdir(Path::new(&current), 0o755) {
+                    match sftp.stat(Path::new(&current)) {
+                        Ok(stat) if stat.file_type().is_dir() => {}
+                        _ => {
+                            return Err(error)
+                                .with_context(|| format!("failed to create {current}"));
+                        }
+                    }
+                }
+            }
+            Err(error) => return Err(error).with_context(|| format!("failed to stat {current}")),
         }
     }
     Ok(())
+}
+
+fn is_missing_remote_entry(error: &ssh2::Error) -> bool {
+    matches!(
+        error.code(),
+        ssh2::ErrorCode::Session(-16) | ssh2::ErrorCode::SFTP(2 | 10)
+    )
 }
 
 fn secret_value(inline: Option<&String>, file: &Path) -> Result<Option<String>> {
@@ -755,6 +837,30 @@ mod tests {
     #[test]
     fn five_field_cron_is_accepted() {
         parse_schedule("0 1 * * *").unwrap();
+    }
+
+    #[test]
+    fn parses_schedule_command_cron_argument() {
+        let cli = Cli::try_parse_from([
+            "docker-volume-backups",
+            "schedule",
+            "--backup-cron",
+            "0 2 * * *",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Schedule { backup_cron } => assert_eq!(backup_cron, "0 2 * * *"),
+            other => panic!("expected schedule command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn options_without_command_are_rejected() {
+        let error =
+            Cli::try_parse_from(["docker-volume-backups", "--volumes-root", "/tmp"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::MissingSubcommand);
     }
 
     #[test]

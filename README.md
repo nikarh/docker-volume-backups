@@ -1,8 +1,8 @@
-# fileserver-backup
+# docker-volume-backups
 
-`fileserver-backup` is a small Rust backup tool for Dockerized file servers. It discovers volumes mounted as subdirectories, streams each volume into a `.tar.xz` archive, stores archives in either local storage or SFTP storage, restores a single volume, and removes old archives using a retention policy.
+`docker-volume-backups` is a small Rust backup tool for Dockerized file servers. It discovers volumes mounted as subdirectories, streams each volume into a `.tar.xz` archive, stores archives in either local storage or SFTP storage, restores a single volume, and removes old archives using a retention policy.
 
-The container defaults to `fileserver-backup run`, which waits for `BACKUP_CRON` and then runs `backup-all` followed by `cleanup`. The default schedule is daily at 01:00 local time:
+The container defaults to `docker-volume-backups schedule`, which waits for `BACKUP_CRON` and then runs `backup-all` followed by `cleanup`. The default schedule is daily at 01:00 local time:
 
 ```cron
 0 1 * * *
@@ -23,7 +23,7 @@ Both storage drivers create missing destination directories recursively when wri
 ## Commands
 
 ```text
-fileserver-backup [OPTIONS] [COMMAND]
+docker-volume-backups [OPTIONS] <COMMAND>
 ```
 
 Commands:
@@ -34,14 +34,14 @@ restore <VOLUME> [--archive X]  Restore one volume, defaulting to the newest arc
 backup-all                      Back up every subdirectory under VOLUMES_ROOT
 restore-all [--archive X]       Restore every subdirectory under VOLUMES_ROOT
 cleanup                         Apply retention policy to every discovered volume
-run                             Run the cron scheduler
+schedule [--backup-cron X]      Run the cron scheduler
 ```
 
-If no command is supplied, `run` is used.
+If no command is supplied, help is shown.
 
 ## Configuration
 
-Every option can be supplied as a CLI flag or environment variable.
+Every option can be supplied as a CLI flag or environment variable. Command-specific flags are shown with their command.
 
 | Flag | Env var | Default | Description |
 | --- | --- | --- | --- |
@@ -59,9 +59,11 @@ Every option can be supplied as a CLI flag or environment variable.
 | `--retention-count` | `RETENTION_COUNT` | `7` | Number of archives to keep per volume for `count` policy. |
 | `--retention-min-count` | `RETENTION_MIN_COUNT` | `2` | Minimum archives to keep per volume for `size` policy. |
 | `--retention-max-total-size` | `RETENTION_MAX_TOTAL_SIZE` | `10GiB` | Maximum total archive size per volume for `size` policy. |
-| `--backup-cron` | `BACKUP_CRON` | `0 1 * * *` | Cron expression for `run`. Five-field cron expressions are accepted. |
+| `schedule --backup-cron` | `BACKUP_CRON` | `0 1 * * *` | Cron expression for `schedule`. Five-field cron expressions are accepted. |
 
 Size values accept `B`, `KB`, `MB`, `GB`, `TB`, `KiB`, `MiB`, `GiB`, and `TiB`.
+
+Logs default to `info`. Set `RUST_LOG` to override the log filter.
 
 ## Docker Compose: local storage
 

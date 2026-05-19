@@ -46,7 +46,7 @@ jobs:
         run: cargo build --locked --release
 
       - name: Build container image
-        run: docker build -t fileserver-backup:ci .
+        run: docker build -t docker-volume-backups:ci .
 
   publish-main-image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

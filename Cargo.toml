@@ -1,5 +1,5 @@
 [package]
-name = "fileserver-backup"
+name = "docker-volume-backups"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
