@@ -1,0 +1,28 @@
+[package]
+name = "fileserver-backup"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.44", features = ["clock", "std"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+cron = "0.16.0"
+env_logger = "0.11.10"
+filetime = "0.2.29"
+humantime = "2.3.0"
+log = "0.4.29"
+ssh2 = { version = "0.9.5", features = ["vendored-openssl"] }
+tar = "0.4.46"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+url = "2.5.8"
+walkdir = "2.5.0"
+xz2 = { version = "0.1.7", features = ["static"] }
