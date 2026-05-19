@@ -144,6 +144,38 @@ struct ArchiveInfo {
     size: u64,
 }
 
+struct CountingWriter<W> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 trait Storage {
     fn put(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Write + '_>>;
     fn get(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Read + '_>>;
@@ -356,7 +388,7 @@ fn main() -> Result<()> {
         Command::Backup { volume } => {
             info!("executing backup command for volume {volume}");
             let mut storage = build_storage(&cli)?;
-            backup_volume(&cli.volumes_root, storage.as_mut(), volume)?;
+            backup_volume(&cli.volumes_root, storage.as_mut(), volume, None)?;
         }
         Command::Restore { volume, archive } => {
             info!("executing restore command for volume {volume}");
@@ -411,7 +443,12 @@ fn validate_config(config: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn backup_volume(volumes_root: &Path, storage: &mut dyn Storage, volume: &str) -> Result<()> {
+fn backup_volume(
+    volumes_root: &Path,
+    storage: &mut dyn Storage,
+    volume: &str,
+    progress: Option<(usize, usize)>,
+) -> Result<ArchiveInfo> {
     validate_volume_name(volume)?;
     let source = volumes_root.join(volume);
     if !source.is_dir() {
@@ -419,17 +456,19 @@ fn backup_volume(volumes_root: &Path, storage: &mut dyn Storage, volume: &str) -
     }
 
     let archive = format!("{}.tar.xz", Utc::now().format("%Y-%m-%dT%H-%M-%SZ"));
-    info!(
-        "backing up volume {volume} from {} to archive {archive}",
-        source.display()
-    );
-    let writer = storage.put(volume, &archive)?;
+    let writer = CountingWriter::new(storage.put(volume, &archive)?);
     let encoder = XzEncoder::new(writer, 6);
     let mut tar = Builder::new(encoder);
     append_directory_contents(&mut tar, &source)?;
     let encoder = tar.into_inner().context("failed to finish tar stream")?;
-    encoder.finish().context("failed to finish xz stream")?;
-    Ok(())
+    let mut writer = encoder.finish().context("failed to finish xz stream")?;
+    writer.flush().context("failed to flush archive stream")?;
+    let archive_info = ArchiveInfo {
+        name: archive,
+        size: writer.bytes_written(),
+    };
+    log_backup_completed(volume, &source, &archive_info, progress);
+    Ok(archive_info)
 }
 
 fn restore_volume(
@@ -459,12 +498,12 @@ fn backup_all(volumes_root: &Path, storage: &mut dyn Storage) -> Result<()> {
     let volumes = discover_volumes(volumes_root)?;
     info!("backing up {} volume(s)", volumes.len());
     for (index, volume) in volumes.iter().enumerate() {
-        info!(
-            "backing up volume {volume} ({}/{})",
-            index + 1,
-            volumes.len()
-        );
-        backup_volume(volumes_root, storage, volume)?;
+        backup_volume(
+            volumes_root,
+            storage,
+            volume,
+            Some((index + 1, volumes.len())),
+        )?;
     }
     Ok(())
 }
@@ -659,6 +698,58 @@ fn archives_to_remove_for_size(
     to_remove
 }
 
+fn log_backup_completed(
+    volume: &str,
+    source: &Path,
+    archive: &ArchiveInfo,
+    progress: Option<(usize, usize)>,
+) {
+    let size = format_human_size(archive.size);
+    match progress {
+        Some((index, total)) => info!(
+            "backed up volume {volume} ({index}/{total}) from {} to archive {} ({size})",
+            source.display(),
+            archive.name
+        ),
+        None => info!(
+            "backed up volume {volume} from {} to archive {} ({size})",
+            source.display(),
+            archive.name
+        ),
+    }
+}
+
+fn format_human_size(bytes: u64) -> String {
+    const UNITS: [(&str, u128); 5] = [
+        ("b", 1),
+        ("kb", 1_000),
+        ("mb", 1_000_000),
+        ("gb", 1_000_000_000),
+        ("tb", 1_000_000_000_000),
+    ];
+
+    let bytes = u128::from(bytes);
+    let unit_index = UNITS
+        .iter()
+        .rposition(|(_, divisor)| bytes >= *divisor)
+        .unwrap_or(0);
+    let (unit, divisor) = UNITS[unit_index];
+
+    if unit_index == 0 {
+        return format!("{bytes}{unit}");
+    }
+
+    let rounded_tenths = ((bytes * 10) + (divisor / 2)) / divisor;
+    if rounded_tenths >= 100 {
+        return format!("{}{}", (bytes + (divisor / 2)) / divisor, unit);
+    }
+    if rounded_tenths % 10 == 0 {
+        format!("{}{}", rounded_tenths / 10, unit)
+    } else {
+        format!("{}.{}{}", rounded_tenths / 10, rounded_tenths % 10, unit)
+    }
+}
+
 fn parse_schedule(expression: &str) -> Result<Schedule> {
     let fields = expression.split_whitespace().count();
     let cron_expression = match fields {
@@ -813,6 +904,15 @@ mod tests {
     }
 
     #[test]
+    fn formats_human_sizes() {
+        assert_eq!(format_human_size(999), "999b");
+        assert_eq!(format_human_size(1_500), "1.5kb");
+        assert_eq!(format_human_size(10_000), "10kb");
+        assert_eq!(format_human_size(10_000_000), "10mb");
+        assert_eq!(format_human_size(1_000_000_000), "1gb");
+    }
+
+    #[test]
     fn size_retention_keeps_minimum_count() {
         let archives = vec![
             ArchiveInfo {
@@ -905,8 +1005,9 @@ mod tests {
         fs::write(app_volume.join("state.txt"), "app data").unwrap();
 
         let mut storage = LocalStorage::new(backups_root.clone());
-        backup_volume(&volumes_root, &mut storage, "app").unwrap();
+        let archive = backup_volume(&volumes_root, &mut storage, "app", None).unwrap();
 
+        assert!(archive.size > 0);
         assert_eq!(storage.list("app").unwrap().len(), 1);
         assert!(backups_root.join("app").is_dir());
     }

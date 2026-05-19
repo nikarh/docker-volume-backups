@@ -63,7 +63,7 @@ Every option can be supplied as a CLI flag or environment variable. Command-spec
 
 Size values accept `B`, `KB`, `MB`, `GB`, `TB`, `KiB`, `MiB`, `GiB`, and `TiB`.
 
-Logs default to `info`. Set `RUST_LOG` to override the log filter.
+Logs default to `info`. Set `RUST_LOG` to override the log filter. Backup logs include each completed archive name and compressed size.
 
 ## Docker Compose: local storage
 
