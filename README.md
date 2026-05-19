@@ -74,7 +74,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 128
     cpus: "0.50"
     mem_limit: 512m
     environment:
@@ -110,7 +109,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 128
     cpus: "0.50"
     mem_limit: 512m
     environment:
