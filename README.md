@@ -68,7 +68,6 @@ This example backs up two read-only volumes into a writable local backup volume.
 services:
   backup:
     image: ghcr.io/nikarh/docker-voume-backups:latest
-    user: "65532:65532"
     read_only: true
     cap_drop:
       - ALL
@@ -103,7 +102,6 @@ This example streams backups to SFTP using an SSH private key mounted as a Docke
 services:
   backup:
     image: ghcr.io/nikarh/docker-voume-backups:latest
-    user: "65532:65532"
     read_only: true
     cap_drop:
       - ALL
@@ -143,7 +141,6 @@ docker run --rm \
   --read-only \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
-  --user 65532:65532 \
   -e STORAGE_DRIVER=local \
   -e LOCAL_STORAGE_ROOT=/backups \
   -v app-data:/volumes/app-data:rw \
