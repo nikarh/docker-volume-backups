@@ -20,7 +20,7 @@ yanked = "deny"
 [licenses]
 version = 2
 private = { ignore = true }
-allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0"]
 confidence-threshold = 0.9
 
 [bans]

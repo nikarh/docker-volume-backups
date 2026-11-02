@@ -16,7 +16,7 @@ use cron::Schedule;
 use filetime::FileTime;
 use log::{info, warn};
 use ssh2::{FileStat, Session, Sftp};
-use tar::{Archive, Builder, EntryType, Header};
+use tar::{Archive, Builder, EntryType, Header, HeaderMode};
 use url::Url;
 use walkdir::WalkDir;
 use xz2::{read::XzDecoder, write::XzEncoder};
@@ -27,6 +27,12 @@ const DEFAULT_BACKUP_CRON: &str = "0 1 * * *";
 const DEFAULT_SFTP_PASSWORD_FILE: &str = "/run/secrets/SFTP_PASSWORD";
 const DEFAULT_SFTP_PRIVATE_KEY_FILE: &str = "/run/secrets/SFTP_PRIVATE_KEY";
 const DEFAULT_SFTP_PRIVATE_KEY_PASSPHRASE_FILE: &str = "/run/secrets/SFTP_PRIVATE_KEY_PASSPHRASE";
+/// Buffer between the archive encoder and storage. Large writes let libssh2
+/// pipeline many SFTP packets per round trip instead of waiting for an ack
+/// after every few kilobytes.
+const STORAGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+/// Buffer used to read source files and archives in large blocks.
+const READ_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, subcommand_required = true)]
@@ -77,6 +83,14 @@ struct Cli {
     )]
     sftp_private_key_passphrase_file: PathBuf,
 
+    /// Archive compression for new backups. Restores detect it from the file extension.
+    #[arg(long, env = "COMPRESSION", default_value = "zstd")]
+    compression: CompressionKind,
+
+    /// Compression level; defaults to 3 for zstd and 6 for xz.
+    #[arg(long, env = "COMPRESSION_LEVEL")]
+    compression_level: Option<u32>,
+
     #[arg(long, env = "RETENTION_POLICY", default_value = "count")]
     retention_policy: RetentionPolicyKind,
 
@@ -102,6 +116,59 @@ struct Cli {
 enum StorageDriverKind {
     Local,
     Sftp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompressionKind {
+    Zstd,
+    Xz,
+}
+
+impl CompressionKind {
+    const ALL: [Self; 2] = [Self::Zstd, Self::Xz];
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Zstd => ".tar.zst",
+            Self::Xz => ".tar.xz",
+        }
+    }
+
+    fn from_archive_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| name.ends_with(kind.extension()))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Compression {
+    kind: CompressionKind,
+    level: u32,
+}
+
+impl Compression {
+    fn from_config(config: &Cli) -> Self {
+        let level = config
+            .compression_level
+            .unwrap_or(match config.compression {
+                CompressionKind::Zstd => 3,
+                CompressionKind::Xz => 6,
+            });
+        Self {
+            kind: config.compression,
+            level,
+        }
+    }
+}
+
+impl Default for Compression {
+    fn default() -> Self {
+        Self {
+            kind: CompressionKind::Zstd,
+            level: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -205,14 +272,17 @@ impl Storage for LocalStorage {
         let path = dir.join(archive);
         let file = File::create(&path)
             .with_context(|| format!("failed to create archive {}", path.display()))?;
-        Ok(Box::new(BufWriter::new(file)))
+        Ok(Box::new(BufWriter::with_capacity(
+            STORAGE_BUFFER_SIZE,
+            file,
+        )))
     }
 
     fn get(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Read + '_>> {
         let path = self.volume_dir(volume).join(archive);
         let file = File::open(&path)
             .with_context(|| format!("failed to open archive {}", path.display()))?;
-        Ok(Box::new(BufReader::new(file)))
+        Ok(Box::new(BufReader::with_capacity(READ_BUFFER_SIZE, file)))
     }
 
     fn list(&mut self, volume: &str) -> Result<Vec<ArchiveInfo>> {
@@ -328,7 +398,10 @@ impl Storage for SftpStorage {
             .sftp
             .create(Path::new(&path))
             .with_context(|| format!("failed to create remote archive {path}"))?;
-        Ok(Box::new(file))
+        Ok(Box::new(BufWriter::with_capacity(
+            STORAGE_BUFFER_SIZE,
+            file,
+        )))
     }
 
     fn get(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Read + '_>> {
@@ -337,7 +410,10 @@ impl Storage for SftpStorage {
             .sftp
             .open(Path::new(&path))
             .with_context(|| format!("failed to open remote archive {path}"))?;
-        Ok(Box::new(file))
+        Ok(Box::new(BufReader::with_capacity(
+            STORAGE_BUFFER_SIZE,
+            file,
+        )))
     }
 
     fn list(&mut self, volume: &str) -> Result<Vec<ArchiveInfo>> {
@@ -388,7 +464,13 @@ fn main() -> Result<()> {
         Command::Backup { volume } => {
             info!("executing backup command for volume {volume}");
             let mut storage = build_storage(&cli)?;
-            backup_volume(&cli.volumes_root, storage.as_mut(), volume, None)?;
+            backup_volume(
+                &cli.volumes_root,
+                storage.as_mut(),
+                Compression::from_config(&cli),
+                volume,
+                None,
+            )?;
         }
         Command::Restore { volume, archive } => {
             info!("executing restore command for volume {volume}");
@@ -408,7 +490,11 @@ fn main() -> Result<()> {
         Command::BackupAll => {
             info!("executing backup-all command");
             let mut storage = build_storage(&cli)?;
-            backup_all(&cli.volumes_root, storage.as_mut())?;
+            backup_all(
+                &cli.volumes_root,
+                storage.as_mut(),
+                Compression::from_config(&cli),
+            )?;
         }
         Command::Cleanup => {
             info!("executing cleanup command");
@@ -440,12 +526,25 @@ fn validate_config(config: &Cli) -> Result<()> {
     if config.retention_min_count == 0 {
         bail!("RETENTION_MIN_COUNT must be greater than 0");
     }
+    if let Some(level) = config.compression_level {
+        let valid = match config.compression {
+            CompressionKind::Zstd => (1..=22).contains(&level),
+            CompressionKind::Xz => level <= 9,
+        };
+        if !valid {
+            bail!(
+                "COMPRESSION_LEVEL {level} is out of range for {:?}",
+                config.compression
+            );
+        }
+    }
     Ok(())
 }
 
 fn backup_volume(
     volumes_root: &Path,
     storage: &mut dyn Storage,
+    compression: Compression,
     volume: &str,
     progress: Option<(usize, usize)>,
 ) -> Result<ArchiveInfo> {
@@ -455,13 +554,30 @@ fn backup_volume(
         bail!("volume {volume} does not exist at {}", source.display());
     }
 
-    let archive = format!("{}.tar.xz", Utc::now().format("%Y-%m-%dT%H-%M-%SZ"));
+    let archive = format!(
+        "{}{}",
+        Utc::now().format("%Y-%m-%dT%H-%M-%SZ"),
+        compression.kind.extension()
+    );
     let writer = CountingWriter::new(storage.put(volume, &archive)?);
-    let encoder = XzEncoder::new(writer, 6);
-    let mut tar = Builder::new(encoder);
-    append_directory_contents(&mut tar, &source)?;
-    let encoder = tar.into_inner().context("failed to finish tar stream")?;
-    let mut writer = encoder.finish().context("failed to finish xz stream")?;
+    let mut writer = match compression.kind {
+        CompressionKind::Zstd => {
+            let level = i32::try_from(compression.level).context("invalid zstd level")?;
+            let encoder =
+                zstd::Encoder::new(writer, level).context("failed to create zstd encoder")?;
+            let mut tar = Builder::new(encoder);
+            append_directory_contents(&mut tar, &source)?;
+            let encoder = tar.into_inner().context("failed to finish tar stream")?;
+            encoder.finish().context("failed to finish zstd stream")?
+        }
+        CompressionKind::Xz => {
+            let encoder = XzEncoder::new(writer, compression.level);
+            let mut tar = Builder::new(encoder);
+            append_directory_contents(&mut tar, &source)?;
+            let encoder = tar.into_inner().context("failed to finish tar stream")?;
+            encoder.finish().context("failed to finish xz stream")?
+        }
+    };
     writer.flush().context("failed to flush archive stream")?;
     let archive_info = ArchiveInfo {
         name: archive,
@@ -487,20 +603,35 @@ fn restore_volume(
         None => latest_archive(storage, volume)?.context("no backup archives found")?,
     };
     info!("restoring {volume} from {archive}");
+    let kind = CompressionKind::from_archive_name(&archive)
+        .with_context(|| format!("unsupported archive format {archive}"))?;
     let reader = storage.get(volume, &archive)?;
-    let decoder = XzDecoder::new(reader);
+    let decoder: Box<dyn Read + '_> = match kind {
+        CompressionKind::Zstd => {
+            Box::new(zstd::Decoder::new(reader).context("failed to create zstd decoder")?)
+        }
+        CompressionKind::Xz => Box::new(BufReader::with_capacity(
+            READ_BUFFER_SIZE,
+            XzDecoder::new(reader),
+        )),
+    };
     let mut tar = Archive::new(decoder);
     tar.unpack(&target)
         .with_context(|| format!("failed to unpack archive into {}", target.display()))
 }
 
-fn backup_all(volumes_root: &Path, storage: &mut dyn Storage) -> Result<()> {
+fn backup_all(
+    volumes_root: &Path,
+    storage: &mut dyn Storage,
+    compression: Compression,
+) -> Result<()> {
     let volumes = discover_volumes(volumes_root)?;
     info!("backing up {} volume(s)", volumes.len());
     for (index, volume) in volumes.iter().enumerate() {
         backup_volume(
             volumes_root,
             storage,
+            compression,
             volume,
             Some((index + 1, volumes.len())),
         )?;
@@ -584,7 +715,11 @@ fn run_scheduler(config: &Cli, backup_cron: &str) -> Result<()> {
 
         let result = (|| -> Result<()> {
             let mut storage = build_storage(config)?;
-            backup_all(&config.volumes_root, storage.as_mut())?;
+            backup_all(
+                &config.volumes_root,
+                storage.as_mut(),
+                Compression::from_config(config),
+            )?;
             cleanup_all(
                 &config.volumes_root,
                 storage.as_mut(),
@@ -640,8 +775,12 @@ fn append_directory_contents<W: Write>(tar: &mut Builder<W>, root: &Path) -> Res
         if metadata.is_dir() {
             tar.append_dir(relative, path)?;
         } else if metadata.is_file() {
-            let mut file = File::open(path)?;
-            tar.append_file(relative, &mut file)?;
+            let file = File::open(path)?;
+            let mut header = Header::new_gnu();
+            header.set_metadata_in_mode(&metadata, HeaderMode::Complete);
+            // A BufReader makes io::copy read in large blocks instead of 8 KiB.
+            let reader = BufReader::with_capacity(READ_BUFFER_SIZE, file);
+            tar.append_data(&mut header, relative, reader)?;
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(path)?;
             let mut header = Header::new_gnu();
@@ -794,7 +933,7 @@ fn validate_volume_name(volume: &str) -> Result<()> {
 }
 
 fn is_archive_name(name: &str) -> bool {
-    name.ends_with(".tar.xz")
+    CompressionKind::from_archive_name(name).is_some()
 }
 
 fn parse_size(value: &str) -> Result<u64, String> {
@@ -977,7 +1116,7 @@ mod tests {
         fs::write(media_volume.join("state.txt"), "old media").unwrap();
 
         let mut storage = LocalStorage::new(backups_root);
-        backup_all(&volumes_root, &mut storage).unwrap();
+        backup_all(&volumes_root, &mut storage, Compression::default()).unwrap();
 
         fs::write(app_volume.join("state.txt"), "new app").unwrap();
         fs::write(media_volume.join("state.txt"), "new media").unwrap();
@@ -1005,10 +1144,72 @@ mod tests {
         fs::write(app_volume.join("state.txt"), "app data").unwrap();
 
         let mut storage = LocalStorage::new(backups_root.clone());
-        let archive = backup_volume(&volumes_root, &mut storage, "app", None).unwrap();
+        let archive = backup_volume(
+            &volumes_root,
+            &mut storage,
+            Compression::default(),
+            "app",
+            None,
+        )
+        .unwrap();
 
         assert!(archive.size > 0);
         assert_eq!(storage.list("app").unwrap().len(), 1);
         assert!(backups_root.join("app").is_dir());
+    }
+
+    #[test]
+    fn restores_legacy_xz_and_zstd_archives() {
+        let temp = tempfile::tempdir().unwrap();
+        let volumes_root = temp.path().join("volumes");
+        let app_volume = volumes_root.join("app");
+        fs::create_dir_all(app_volume.join("nested")).unwrap();
+        let payload = (0..300_000u32)
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        fs::write(app_volume.join("nested").join("big.bin"), &payload).unwrap();
+
+        for kind in CompressionKind::ALL {
+            let mut storage = LocalStorage::new(temp.path().join(format!("backups-{kind:?}")));
+            let compression = Compression { kind, level: 1 };
+            let archive =
+                backup_volume(&volumes_root, &mut storage, compression, "app", None).unwrap();
+            assert!(archive.name.ends_with(kind.extension()));
+
+            fs::remove_dir_all(&app_volume).unwrap();
+            restore_volume(&volumes_root, &mut storage, "app", None).unwrap();
+            assert_eq!(
+                fs::read(app_volume.join("nested").join("big.bin")).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_archive_formats_sort_by_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("app");
+        fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "2026-01-02T01-00-00Z.tar.zst",
+            "2026-01-01T01-00-00Z.tar.xz",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        let mut storage = LocalStorage::new(temp.path().to_owned());
+        let names = storage
+            .list("app")
+            .unwrap()
+            .into_iter()
+            .map(|archive| archive.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "2026-01-01T01-00-00Z.tar.xz",
+                "2026-01-02T01-00-00Z.tar.zst"
+            ]
+        );
     }
 }

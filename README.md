@@ -1,6 +1,6 @@
 # docker-volume-backups
 
-`docker-volume-backups` is a small Rust backup tool for Dockerized file servers. It discovers volumes mounted as subdirectories, streams each volume into a `.tar.xz` archive, stores archives in either local storage or SFTP storage, restores a single volume, and removes old archives using a retention policy.
+`docker-volume-backups` is a small Rust backup tool for Dockerized file servers. It discovers volumes mounted as subdirectories, streams each volume into a `.tar.zst` (or `.tar.xz`) archive, stores archives in either local storage or SFTP storage, restores a single volume, and removes old archives using a retention policy.
 
 The container defaults to `docker-volume-backups schedule`, which waits for `BACKUP_CRON` and then runs `backup-all` followed by `cleanup`. The default schedule is daily at 01:00 local time:
 
@@ -12,13 +12,23 @@ The container defaults to `docker-volume-backups schedule`, which waits for `BAC
 
 Storage is selected with `STORAGE_DRIVER`.
 
-`local` writes archives to `LOCAL_STORAGE_ROOT/<volume>/<timestamp>.tar.xz`. This is useful when a writable backup disk is mounted into the container.
+`local` writes archives to `LOCAL_STORAGE_ROOT/<volume>/<timestamp>.tar.zst`. This is useful when a writable backup disk is mounted into the container.
 
 `sftp` connects to `SFTP_URL`, for example `ssh://backup@example.com:22/backups`. The tool authenticates with either a password or an SSH private key. Secrets can be provided directly with env vars or through Docker secret files. File paths are configurable and default to Docker secret paths under `/run/secrets`.
 
-SFTP backups stream the tar.xz encoder directly into the remote SFTP file. The archive is not created on local disk first.
+SFTP backups stream the compressed tar directly into the remote SFTP file. The archive is not created on local disk first.
 
 Both storage drivers create missing destination directories recursively when writing archives, including per-volume directories.
+
+## Compression
+
+New archives are compressed with zstd level 3 by default (`.tar.zst`). Set `COMPRESSION=xz` for `.tar.xz` archives and `COMPRESSION_LEVEL` to tune either engine.
+
+zstd is the better fit for small servers. On an Intel J5040, zstd level 3 compressed a 200 MB database in about 3 seconds, while xz level 6 took about 150 seconds (roughly 1.3 MB/s) for an archive about half the size. xz makes sense only when storage is much scarcer than CPU time.
+
+Restores choose the decoder from the archive extension, so switching engines keeps older archives restorable. Retention treats both formats as one timeline ordered by timestamp, so the old format's archives age out normally.
+
+Source files are read in 2 MiB blocks, and archive data is written to and read from storage through 4 MiB buffers. Over SFTP, this keeps many packets in flight instead of waiting for an acknowledgement after every few kilobytes. With 1 ms of latency each way, this made a 200 MB SFTP transfer about 25x faster.
 
 ## Commands
 
@@ -55,6 +65,8 @@ Every option can be supplied as a CLI flag or environment variable. Command-spec
 | `--sftp-private-key-file` | `SFTP_PRIVATE_KEY_FILE` | `/run/secrets/SFTP_PRIVATE_KEY` | File containing the SSH private key. |
 | `--sftp-private-key-passphrase` | `SFTP_PRIVATE_KEY_PASSPHRASE` | unset | SSH private key passphrase secret. |
 | `--sftp-private-key-passphrase-file` | `SFTP_PRIVATE_KEY_PASSPHRASE_FILE` | `/run/secrets/SFTP_PRIVATE_KEY_PASSPHRASE` | File containing the key passphrase. |
+| `--compression` | `COMPRESSION` | `zstd` | `zstd` or `xz` for new archives. Restores pick the decoder from the archive extension, so existing `.tar.xz` archives stay restorable and count toward retention. See [Compression](#compression). |
+| `--compression-level` | `COMPRESSION_LEVEL` | `3` (zstd), `6` (xz) | Compression level: 1-22 for zstd, 0-9 for xz. |
 | `--retention-policy` | `RETENTION_POLICY` | `count` | `count` or `size`. |
 | `--retention-count` | `RETENTION_COUNT` | `7` | Number of archives to keep per volume for `count` policy. |
 | `--retention-min-count` | `RETENTION_MIN_COUNT` | `2` | Minimum archives to keep per volume for `size` policy. |
