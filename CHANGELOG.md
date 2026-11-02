@@ -3,13 +3,20 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [0.2.0] - 2026-05-19
+## [0.3.0] - 2026-11-02
 ### Details
 
 #### Added
-- Add restore-all command by @nikarh
+- Add project license files by @nikarh
 
 #### Changed
-- V0.2.0
-[0.2.0]: https://github.com/nikarh/docker-volume-backups/compare/v0.1.1..v0.2.0
+- Make backup execution explicit by @nikarh
+- Log backup archive sizes by @nikarh
+- Zstd compression by default and buffered storage I/O (#1) by @nikarh in #1
+- V0.3.0
+
+#### Fixed
+- Cover storage directory creation by @nikarh
+- Keep backing up when files change or a volume fails (#2) by @nikarh in #2
+[0.3.0]: https://github.com/nikarh/docker-volume-backups/compare/v0.2.0..v0.3.0
 
