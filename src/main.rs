@@ -14,7 +14,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use cron::Schedule;
 use filetime::FileTime;
-use log::{info, warn};
+use log::{error, info, warn};
 use ssh2::{FileStat, Session, Sftp};
 use tar::{Archive, Builder, EntryType, Header, HeaderMode};
 use url::Url;
@@ -33,6 +33,10 @@ const DEFAULT_SFTP_PRIVATE_KEY_PASSPHRASE_FILE: &str = "/run/secrets/SFTP_PRIVAT
 const STORAGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// Buffer used to read source files and archives in large blocks.
 const READ_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// Suffix of an archive that is still being written. It is renamed to its
+/// final name only after the whole stream was written successfully, so an
+/// interrupted backup never shows up as the latest archive.
+const PARTIAL_SUFFIX: &str = ".partial";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, subcommand_required = true)]
@@ -246,8 +250,10 @@ impl<W: Write> Write for CountingWriter<W> {
 trait Storage {
     fn put(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Write + '_>>;
     fn get(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Read + '_>>;
+    /// Lists finished archives and leftover partial archives, sorted by name.
     fn list(&mut self, volume: &str) -> Result<Vec<ArchiveInfo>>;
     fn remove(&mut self, volume: &str, archive: &str) -> Result<()>;
+    fn rename(&mut self, volume: &str, from: &str, to: &str) -> Result<()>;
 }
 
 struct LocalStorage {
@@ -301,7 +307,7 @@ impl Storage for LocalStorage {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if is_archive_name(&name) {
+            if is_archive_name(&name) || is_partial_name(&name) {
                 archives.push(ArchiveInfo {
                     name,
                     size: metadata.len(),
@@ -316,6 +322,13 @@ impl Storage for LocalStorage {
         let path = self.volume_dir(volume).join(archive);
         fs::remove_file(&path)
             .with_context(|| format!("failed to remove archive {}", path.display()))
+    }
+
+    fn rename(&mut self, volume: &str, from: &str, to: &str) -> Result<()> {
+        let dir = self.volume_dir(volume);
+        let (from, to) = (dir.join(from), dir.join(to));
+        fs::rename(&from, &to)
+            .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))
     }
 }
 
@@ -429,7 +442,7 @@ impl Storage for SftpStorage {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !is_regular_file(&stat) || !is_archive_name(name) {
+            if !is_regular_file(&stat) || !(is_archive_name(name) || is_partial_name(name)) {
                 continue;
             }
             archives.push(ArchiveInfo {
@@ -446,6 +459,14 @@ impl Storage for SftpStorage {
         self.sftp
             .unlink(Path::new(&path))
             .with_context(|| format!("failed to remove remote archive {path}"))
+    }
+
+    fn rename(&mut self, volume: &str, from: &str, to: &str) -> Result<()> {
+        let from = self.path(volume, Some(from));
+        let to = self.path(volume, Some(to));
+        self.sftp
+            .rename(Path::new(&from), Path::new(&to), None)
+            .with_context(|| format!("failed to rename remote archive {from} to {to}"))
     }
 }
 
@@ -494,7 +515,8 @@ fn main() -> Result<()> {
                 &cli.volumes_root,
                 storage.as_mut(),
                 Compression::from_config(&cli),
-            )?;
+            )?
+            .into_result("backup")?;
         }
         Command::Cleanup => {
             info!("executing cleanup command");
@@ -559,32 +581,61 @@ fn backup_volume(
         Utc::now().format("%Y-%m-%dT%H-%M-%SZ"),
         compression.kind.extension()
     );
-    let writer = CountingWriter::new(storage.put(volume, &archive)?);
-    let mut writer = match compression.kind {
+    let partial = format!("{archive}{PARTIAL_SUFFIX}");
+    let written =
+        write_archive(storage, compression, volume, &partial, &source).and_then(|written| {
+            storage.rename(volume, &partial, &archive)?;
+            Ok(written)
+        });
+    let (size, warnings) = match written {
+        Ok(written) => written,
+        Err(error) => {
+            if let Err(remove_error) = storage.remove(volume, &partial) {
+                warn!("failed to remove partial archive {volume}/{partial}: {remove_error:#}");
+            }
+            return Err(error);
+        }
+    };
+    let archive_info = ArchiveInfo {
+        name: archive,
+        size,
+    };
+    log_backup_completed(volume, &source, &archive_info, warnings, progress);
+    Ok(archive_info)
+}
+
+/// Streams `source` into a new archive and returns the compressed size and
+/// the number of source problems that were skipped with a warning.
+fn write_archive(
+    storage: &mut dyn Storage,
+    compression: Compression,
+    volume: &str,
+    name: &str,
+    source: &Path,
+) -> Result<(u64, usize)> {
+    let writer = CountingWriter::new(storage.put(volume, name)?);
+    let (mut writer, warnings) = match compression.kind {
         CompressionKind::Zstd => {
             let level = i32::try_from(compression.level).context("invalid zstd level")?;
             let encoder =
                 zstd::Encoder::new(writer, level).context("failed to create zstd encoder")?;
             let mut tar = Builder::new(encoder);
-            append_directory_contents(&mut tar, &source)?;
+            let warnings = append_directory_contents(&mut tar, source)?;
             let encoder = tar.into_inner().context("failed to finish tar stream")?;
-            encoder.finish().context("failed to finish zstd stream")?
+            let writer = encoder.finish().context("failed to finish zstd stream")?;
+            (writer, warnings)
         }
         CompressionKind::Xz => {
             let encoder = XzEncoder::new(writer, compression.level);
             let mut tar = Builder::new(encoder);
-            append_directory_contents(&mut tar, &source)?;
+            let warnings = append_directory_contents(&mut tar, source)?;
             let encoder = tar.into_inner().context("failed to finish tar stream")?;
-            encoder.finish().context("failed to finish xz stream")?
+            let writer = encoder.finish().context("failed to finish xz stream")?;
+            (writer, warnings)
         }
     };
     writer.flush().context("failed to flush archive stream")?;
-    let archive_info = ArchiveInfo {
-        name: archive,
-        size: writer.bytes_written(),
-    };
-    log_backup_completed(volume, &source, &archive_info, progress);
-    Ok(archive_info)
+    Ok((writer.bytes_written(), warnings))
 }
 
 fn restore_volume(
@@ -620,23 +671,50 @@ fn restore_volume(
         .with_context(|| format!("failed to unpack archive into {}", target.display()))
 }
 
+/// Backs up every volume, continuing past volumes that fail. Returns the
+/// volumes that were backed up and the ones that failed.
 fn backup_all(
     volumes_root: &Path,
     storage: &mut dyn Storage,
     compression: Compression,
-) -> Result<()> {
+) -> Result<VolumeResults> {
     let volumes = discover_volumes(volumes_root)?;
     info!("backing up {} volume(s)", volumes.len());
+    let mut results = VolumeResults::default();
     for (index, volume) in volumes.iter().enumerate() {
-        backup_volume(
-            volumes_root,
-            storage,
-            compression,
-            volume,
-            Some((index + 1, volumes.len())),
-        )?;
+        let progress = (index + 1, volumes.len());
+        match backup_volume(volumes_root, storage, compression, volume, Some(progress)) {
+            Ok(_) => results.succeeded.push(volume.clone()),
+            Err(error) => {
+                error!(
+                    "backup of volume {volume} ({}/{}) failed: {error:#}",
+                    progress.0, progress.1
+                );
+                results.failed.push(volume.clone());
+            }
+        }
     }
-    Ok(())
+    Ok(results)
+}
+
+#[derive(Debug, Default)]
+struct VolumeResults {
+    succeeded: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl VolumeResults {
+    fn into_result(self, action: &str) -> Result<()> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "{action} failed for {} of {} volume(s): {}",
+            self.failed.len(),
+            self.failed.len() + self.succeeded.len(),
+            self.failed.join(", ")
+        )
+    }
 }
 
 fn restore_all(
@@ -646,15 +724,22 @@ fn restore_all(
 ) -> Result<()> {
     let volumes = discover_volumes(volumes_root)?;
     info!("restoring {} volume(s)", volumes.len());
+    let mut results = VolumeResults::default();
     for (index, volume) in volumes.iter().enumerate() {
         info!(
             "restoring volume {volume} ({}/{})",
             index + 1,
             volumes.len()
         );
-        restore_volume(volumes_root, storage, volume, archive)?;
+        match restore_volume(volumes_root, storage, volume, archive) {
+            Ok(()) => results.succeeded.push(volume.clone()),
+            Err(error) => {
+                error!("restore of volume {volume} failed: {error:#}");
+                results.failed.push(volume.clone());
+            }
+        }
     }
-    Ok(())
+    results.into_result("restore")
 }
 
 fn cleanup_all(
@@ -663,20 +748,50 @@ fn cleanup_all(
     policy: &RetentionPolicy,
 ) -> Result<()> {
     let volumes = discover_volumes(volumes_root)?;
+    cleanup_volumes(storage, &volumes, policy)
+}
+
+/// Applies retention to each volume, continuing past volumes that fail.
+fn cleanup_volumes(
+    storage: &mut dyn Storage,
+    volumes: &[String],
+    policy: &RetentionPolicy,
+) -> Result<()> {
     info!("cleaning up {} volume(s)", volumes.len());
+    let mut results = VolumeResults::default();
     for (index, volume) in volumes.iter().enumerate() {
         info!(
             "cleaning up volume {volume} ({}/{})",
             index + 1,
             volumes.len()
         );
-        cleanup_volume(storage, volume, policy)?;
+        match cleanup_volume(storage, volume, policy) {
+            Ok(()) => results.succeeded.push(volume.clone()),
+            Err(error) => {
+                error!("cleanup of volume {volume} failed: {error:#}");
+                results.failed.push(volume.clone());
+            }
+        }
     }
-    Ok(())
+    results.into_result("cleanup")
 }
 
 fn cleanup_volume(storage: &mut dyn Storage, volume: &str, policy: &RetentionPolicy) -> Result<()> {
-    let archives = storage.list(volume)?;
+    let (archives, partials): (Vec<_>, Vec<_>) = storage
+        .list(volume)?
+        .into_iter()
+        .partition(|archive| is_archive_name(&archive.name));
+    // Partial archives are left behind only by interrupted runs. Cleanup runs
+    // after backups finish, so nothing is writing them anymore.
+    for partial in partials {
+        info!(
+            "removing leftover partial archive {volume}/{}",
+            partial.name
+        );
+        if let Err(error) = storage.remove(volume, &partial.name) {
+            warn!("failed to remove {volume}/{}: {error:#}", partial.name);
+        }
+    }
     let to_remove = match *policy {
         RetentionPolicy::Count { keep } => archives
             .iter()
@@ -696,9 +811,16 @@ fn cleanup_volume(storage: &mut dyn Storage, volume: &str, policy: &RetentionPol
         keep_count
     );
 
+    let mut failed = 0;
     for archive in to_remove {
         info!("removing {volume}/{archive}");
-        storage.remove(volume, &archive)?;
+        if let Err(error) = storage.remove(volume, &archive) {
+            warn!("failed to remove {volume}/{archive}: {error:#}");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        bail!("failed to remove {failed} archive(s)");
     }
     Ok(())
 }
@@ -715,16 +837,20 @@ fn run_scheduler(config: &Cli, backup_cron: &str) -> Result<()> {
 
         let result = (|| -> Result<()> {
             let mut storage = build_storage(config)?;
-            backup_all(
+            let results = backup_all(
                 &config.volumes_root,
                 storage.as_mut(),
                 Compression::from_config(config),
             )?;
-            cleanup_all(
-                &config.volumes_root,
+            // Only rotate archives of volumes that just got a fresh backup, so a
+            // failing volume keeps all of its older archives.
+            let cleanup = cleanup_volumes(
                 storage.as_mut(),
+                &results.succeeded,
                 &retention_policy(config),
-            )
+            );
+            results.into_result("backup")?;
+            cleanup
         })();
 
         match result {
@@ -760,50 +886,204 @@ fn retention_policy(config: &Cli) -> RetentionPolicy {
     }
 }
 
-fn append_directory_contents<W: Write>(tar: &mut Builder<W>, root: &Path) -> Result<()> {
+/// Appends everything under `root` to the archive, skipping files that vanish
+/// or cannot be read with a warning instead of failing the whole backup.
+/// Returns the number of warnings. Errors are returned only when writing the
+/// archive itself fails.
+fn append_directory_contents<W: Write>(tar: &mut Builder<W>, root: &Path) -> Result<usize> {
+    let mut warnings = 0;
+
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = error.path().unwrap_or(root).to_owned();
+                if is_not_found(error.io_error()) {
+                    // Deleted between listing its parent and reading it.
+                    warn!("skipping {}: removed during backup", path.display());
+                } else {
+                    warn!("skipping {}: cannot read: {error}", path.display());
+                }
+                warnings += 1;
+                continue;
+            }
+        };
         let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to make {} relative", path.display()))?;
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
         if relative.as_os_str().is_empty() {
             continue;
         }
 
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            tar.append_dir(relative, path)?;
-        } else if metadata.is_file() {
-            let file = File::open(path)?;
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warnings += source_error(path, &error);
+                    continue;
+                }
+            };
             let mut header = Header::new_gnu();
             header.set_metadata_in_mode(&metadata, HeaderMode::Complete);
-            // A BufReader makes io::copy read in large blocks instead of 8 KiB.
-            let reader = BufReader::with_capacity(READ_BUFFER_SIZE, file);
-            tar.append_data(&mut header, relative, reader)?;
-        } else if metadata.file_type().is_symlink() {
-            let target = fs::read_link(path)?;
+            header.set_entry_type(EntryType::Directory);
+            header.set_size(0);
+            tar.append_data(&mut header, relative, io::empty())?;
+        } else if file_type.is_file() {
+            // Take the metadata from the open handle, so the header describes
+            // the exact file being read even if the path is replaced meanwhile.
+            let opened = File::open(path).and_then(|file| {
+                let metadata = file.metadata()?;
+                Ok((file, metadata))
+            });
+            let (file, metadata) = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    warnings += source_error(path, &error);
+                    continue;
+                }
+            };
+            if !metadata.is_file() {
+                warn!("skipping {}: no longer a regular file", path.display());
+                warnings += 1;
+                continue;
+            }
+            let mut header = Header::new_gnu();
+            header.set_metadata_in_mode(&metadata, HeaderMode::Complete);
+            let mut reader = FixedSizeReader::new(file, metadata.len());
+            // The outer BufReader makes io::copy move data in large blocks.
+            tar.append_data(
+                &mut header,
+                relative,
+                BufReader::with_capacity(READ_BUFFER_SIZE, &mut reader),
+            )?;
+            if let Some(problem) = reader.problem(&metadata) {
+                warn!("{}: {problem}", path.display());
+                warnings += 1;
+            }
+        } else if file_type.is_symlink() {
+            let target = match fs::read_link(path) {
+                Ok(target) => target,
+                Err(error) => {
+                    warnings += source_error(path, &error);
+                    continue;
+                }
+            };
             let mut header = Header::new_gnu();
             header.set_entry_type(EntryType::Symlink);
             header.set_size(0);
             header.set_mode(0o777);
-            if let Ok(modified) = metadata.modified() {
+            if let Some(modified) = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+            {
                 set_header_mtime(&mut header, modified);
             }
             header.set_cksum();
             tar.append_link(&mut header, relative, target)?;
         }
     }
-    Ok(())
+    Ok(warnings)
+}
+
+/// Logs a source file that cannot be archived and returns the warning count.
+fn source_error(path: &Path, error: &io::Error) -> usize {
+    if error.kind() == io::ErrorKind::NotFound {
+        warn!("skipping {}: removed during backup", path.display());
+    } else {
+        warn!("skipping {}: cannot read: {error}", path.display());
+    }
+    1
+}
+
+fn is_not_found(error: Option<&io::Error>) -> bool {
+    error.is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Yields exactly `size` bytes so a tar entry always matches its header: a
+/// file that grew is cut at `size`, and a file that shrank or failed to read
+/// part-way is padded with zeros.
+struct FixedSizeReader<R> {
+    inner: R,
+    remaining: u64,
+    padded: u64,
+    error: Option<io::Error>,
+    eof: bool,
+}
+
+impl<R> FixedSizeReader<R> {
+    fn new(inner: R, size: u64) -> Self {
+        Self {
+            inner,
+            remaining: size,
+            padded: 0,
+            error: None,
+            eof: false,
+        }
+    }
+}
+
+impl FixedSizeReader<File> {
+    /// Describes anything that went wrong while the file was archived.
+    fn problem(&self, before: &fs::Metadata) -> Option<String> {
+        if let Some(error) = &self.error {
+            return Some(format!(
+                "read failed part-way ({error}), archived with {} zero byte(s) of padding",
+                self.padded
+            ));
+        }
+        if self.padded > 0 {
+            return Some(format!(
+                "shrank while being read, archived with {} zero byte(s) of padding",
+                self.padded
+            ));
+        }
+        let after = self.inner.metadata().ok()?;
+        let changed =
+            after.len() != before.len() || after.modified().ok() != before.modified().ok();
+        changed.then(|| "changed while being read, archived copy may be inconsistent".to_owned())
+    }
+}
+
+impl<R: Read> Read for FixedSizeReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let max = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        if max == 0 {
+            return Ok(0);
+        }
+        if self.error.is_none() && !self.eof {
+            match self.inner.read(&mut buffer[..max]) {
+                Ok(0) => self.eof = true,
+                Ok(read) => {
+                    self.remaining -= read as u64;
+                    return Ok(read);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        buffer[..max].fill(0);
+        self.remaining -= max as u64;
+        self.padded += max as u64;
+        Ok(max)
+    }
 }
 
 fn discover_volumes(root: &Path) -> Result<Vec<String>> {
     let mut volumes = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
-        let entry = entry?;
-        if !entry.metadata()?.is_dir() {
-            continue;
-        }
+        let entry = match entry.and_then(|entry| entry.metadata().map(|meta| (entry, meta))) {
+            Ok((entry, metadata)) if metadata.is_dir() => entry,
+            Ok(_) => continue,
+            Err(error) => {
+                warn!("skipping unreadable entry in {}: {error}", root.display());
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         validate_volume_name(&name)?;
         volumes.push(name);
@@ -813,7 +1093,12 @@ fn discover_volumes(root: &Path) -> Result<Vec<String>> {
 }
 
 fn latest_archive(storage: &mut dyn Storage, volume: &str) -> Result<Option<String>> {
-    Ok(storage.list(volume)?.pop().map(|archive| archive.name))
+    Ok(storage
+        .list(volume)?
+        .into_iter()
+        .rev()
+        .find(|archive| is_archive_name(&archive.name))
+        .map(|archive| archive.name))
 }
 
 fn archives_to_remove_for_size(
@@ -841,9 +1126,17 @@ fn log_backup_completed(
     volume: &str,
     source: &Path,
     archive: &ArchiveInfo,
+    warnings: usize,
     progress: Option<(usize, usize)>,
 ) {
-    let size = format_human_size(archive.size);
+    let size = if warnings == 0 {
+        format_human_size(archive.size)
+    } else {
+        format!(
+            "{}, skipped {warnings} problem(s), see warnings above",
+            format_human_size(archive.size)
+        )
+    };
     match progress {
         Some((index, total)) => info!(
             "backed up volume {volume} ({index}/{total}) from {} to archive {} ({size})",
@@ -930,6 +1223,11 @@ fn validate_volume_name(volume: &str) -> Result<()> {
         bail!("invalid volume name {volume:?}");
     }
     Ok(())
+}
+
+fn is_partial_name(name: &str) -> bool {
+    name.strip_suffix(PARTIAL_SUFFIX)
+        .is_some_and(is_archive_name)
 }
 
 fn is_archive_name(name: &str) -> bool {
@@ -1211,5 +1509,203 @@ mod tests {
                 "2026-01-02T01-00-00Z.tar.zst"
             ]
         );
+    }
+
+    /// Local storage that fails writes for chosen volumes after some bytes.
+    struct FlakyStorage {
+        inner: LocalStorage,
+        fail_volume: &'static str,
+    }
+
+    struct FailingWriter<W> {
+        inner: W,
+        budget: usize,
+    }
+
+    impl<W: Write> Write for FailingWriter<W> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.budget == 0 {
+                return Err(io::Error::other("storage went away"));
+            }
+            let len = buffer.len().min(self.budget);
+            self.budget -= len;
+            self.inner.write(&buffer[..len])
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl Storage for FlakyStorage {
+        fn put(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Write + '_>> {
+            let fail = volume == self.fail_volume;
+            let writer = self.inner.put(volume, archive)?;
+            if fail {
+                Ok(Box::new(FailingWriter {
+                    inner: writer,
+                    budget: 100,
+                }))
+            } else {
+                Ok(writer)
+            }
+        }
+        fn get(&mut self, volume: &str, archive: &str) -> Result<Box<dyn Read + '_>> {
+            self.inner.get(volume, archive)
+        }
+        fn list(&mut self, volume: &str) -> Result<Vec<ArchiveInfo>> {
+            self.inner.list(volume)
+        }
+        fn remove(&mut self, volume: &str, archive: &str) -> Result<()> {
+            self.inner.remove(volume, archive)
+        }
+        fn rename(&mut self, volume: &str, from: &str, to: &str) -> Result<()> {
+            self.inner.rename(volume, from, to)
+        }
+    }
+
+    struct Broken;
+
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk error"))
+        }
+    }
+
+    #[test]
+    fn fixed_size_reader_pads_shrunk_and_truncates_grown_input() {
+        let mut shrunk = FixedSizeReader::new(&b"abc"[..], 5);
+        let mut out = Vec::new();
+        shrunk.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"abc\0\0");
+        assert_eq!(shrunk.padded, 2);
+
+        let mut grown = FixedSizeReader::new(&b"abcdef"[..], 4);
+        let mut out = Vec::new();
+        grown.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"abcd");
+        assert_eq!(grown.padded, 0);
+
+        let mut broken = FixedSizeReader::new(Broken, 3);
+        let mut out = Vec::new();
+        broken.read_to_end(&mut out).unwrap();
+        assert_eq!(out, [0, 0, 0]);
+        assert!(broken.error.is_some());
+    }
+
+    #[test]
+    fn shrunk_file_keeps_archive_readable() {
+        let mut tar = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_size(10);
+        header.set_mode(0o644);
+        tar.append_data(
+            &mut header,
+            "short.bin",
+            FixedSizeReader::new(&b"1234"[..], 10),
+        )
+        .unwrap();
+        let mut header = Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, "next.txt", &b"ok"[..])
+            .unwrap();
+        let bytes = tar.into_inner().unwrap();
+
+        let mut archive = Archive::new(&bytes[..]);
+        let mut entries = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            entries.push((entry.path().unwrap().display().to_string(), data));
+        }
+        assert_eq!(
+            entries,
+            [
+                ("short.bin".to_owned(), b"1234\0\0\0\0\0\0".to_vec()),
+                ("next.txt".to_owned(), b"ok".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_file_is_skipped_with_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let volumes_root = temp.path().join("volumes");
+        let app = volumes_root.join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("good.txt"), "good").unwrap();
+        fs::write(app.join("secret.txt"), "secret").unwrap();
+        fs::set_permissions(app.join("secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(app.join("secret.txt")).is_ok() {
+            // Running as root: permissions cannot make the file unreadable.
+            return;
+        }
+
+        let mut storage = LocalStorage::new(temp.path().join("backups"));
+        backup_volume(
+            &volumes_root,
+            &mut storage,
+            Compression::default(),
+            "app",
+            None,
+        )
+        .unwrap();
+
+        fs::remove_dir_all(&app).unwrap();
+        restore_volume(&volumes_root, &mut storage, "app", None).unwrap();
+        assert_eq!(fs::read_to_string(app.join("good.txt")).unwrap(), "good");
+        assert!(!app.join("secret.txt").exists());
+    }
+
+    #[test]
+    fn failing_volume_does_not_stop_other_volumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let volumes_root = temp.path().join("volumes");
+        for volume in ["a", "bad", "c"] {
+            fs::create_dir_all(volumes_root.join(volume)).unwrap();
+            let payload = (0..100_000u32)
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            fs::write(volumes_root.join(volume).join("data.bin"), payload).unwrap();
+        }
+
+        let mut storage = FlakyStorage {
+            inner: LocalStorage::new(temp.path().join("backups")),
+            fail_volume: "bad",
+        };
+        let results = backup_all(&volumes_root, &mut storage, Compression::default()).unwrap();
+        assert_eq!(results.succeeded, ["a", "c"]);
+        assert_eq!(results.failed, ["bad"]);
+        // The interrupted archive was cleaned up instead of looking like a backup.
+        assert!(storage.list("bad").unwrap().is_empty());
+        assert_eq!(storage.list("a").unwrap().len(), 1);
+        assert!(results.into_result("backup").is_err());
+    }
+
+    #[test]
+    fn leftover_partial_archives_are_ignored_and_cleaned_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("app");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("2026-01-01T01-00-00Z.tar.zst"), "x").unwrap();
+        fs::write(dir.join("2026-01-02T01-00-00Z.tar.zst.partial"), "x").unwrap();
+
+        let mut storage = LocalStorage::new(temp.path().to_owned());
+        assert_eq!(
+            latest_archive(&mut storage, "app").unwrap().as_deref(),
+            Some("2026-01-01T01-00-00Z.tar.zst")
+        );
+        cleanup_volume(&mut storage, "app", &RetentionPolicy::Count { keep: 1 }).unwrap();
+        let names = storage
+            .list("app")
+            .unwrap()
+            .into_iter()
+            .map(|archive| archive.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["2026-01-01T01-00-00Z.tar.zst"]);
     }
 }

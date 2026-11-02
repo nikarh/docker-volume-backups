@@ -20,6 +20,18 @@ SFTP backups stream the compressed tar directly into the remote SFTP file. The a
 
 Both storage drivers create missing destination directories recursively when writing archives, including per-volume directories.
 
+## Failure handling
+
+Backups run against live volumes and are best-effort:
+
+- A file or directory that is deleted, replaced, or unreadable while the backup runs is skipped with a warning. The rest of the volume is still archived.
+- Each file is archived at the size it had when opened. A file that grows meanwhile is cut at that size. A file that shrinks or fails to read part-way is padded with zeros and logged as a warning, so the archive stays valid. A file that changed while it was read is also logged, since its archived copy may be inconsistent.
+- Archives are written as `<timestamp>.tar.zst.partial` and renamed only after the whole stream has been written. An interrupted backup never appears as the latest archive for restore or retention, and `cleanup` removes leftover partial files.
+- A volume whose backup fails, for example because of a storage error, is logged, and the remaining volumes are still processed. `restore-all` and `cleanup` also continue past a failing volume.
+- After a run, `schedule` applies retention only to volumes that were backed up successfully, so a failing volume keeps all of its older archives.
+
+Each backup log line reports how many problems were skipped. `backup-all`, `restore-all`, and `cleanup` exit with an error when at least one volume failed. Skipped files alone don't cause an error.
+
 ## Compression
 
 New archives are compressed with zstd level 3 by default (`.tar.zst`). Set `COMPRESSION=xz` for `.tar.xz` archives and `COMPRESSION_LEVEL` to tune either engine.
