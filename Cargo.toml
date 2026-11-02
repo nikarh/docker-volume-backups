@@ -24,3 +24,4 @@ thiserror = "2.0.18"
 url = "2.5.8"
 walkdir = "2.5.0"
 xz2 = { version = "0.1.7", features = ["static"] }
+zstd = "0.14.3"
