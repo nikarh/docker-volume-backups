@@ -19,11 +19,17 @@ RUN set -eux; \
   esac; \
   rustup target add "$rust_target"; \
   cargo build --locked --release --target "$rust_target"; \
-  cp "target/$rust_target/release/docker-volume-backups" /docker-volume-backups
+  mkdir -p /rootfs; \
+  cp "target/$rust_target/release/docker-volume-backups" /rootfs/; \
+  # Mount point for SCRATCH_DIR. A new named volume mounted here copies this
+  # mode, so it is writable whichever user the container runs as.
+  mkdir -m 1777 /rootfs/scratch
 
 FROM scratch
 
-COPY --from=builder /docker-volume-backups /docker-volume-backups
+# Copying the directory's contents keeps the mode of /scratch, which
+# copying /scratch itself would not.
+COPY --from=builder /rootfs/ /
 
 USER 65532:65532
 ENTRYPOINT ["/docker-volume-backups"]

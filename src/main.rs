@@ -1,12 +1,17 @@
 use std::{
     env,
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
+    mem::MaybeUninit,
     net::TcpStream,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     str::FromStr,
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +32,7 @@ const DEFAULT_BACKUP_CRON: &str = "0 1 * * *";
 const DEFAULT_SFTP_PASSWORD_FILE: &str = "/run/secrets/SFTP_PASSWORD";
 const DEFAULT_SFTP_PRIVATE_KEY_FILE: &str = "/run/secrets/SFTP_PRIVATE_KEY";
 const DEFAULT_SFTP_PRIVATE_KEY_PASSPHRASE_FILE: &str = "/run/secrets/SFTP_PRIVATE_KEY_PASSPHRASE";
+const DEFAULT_SCRATCH_DIR: &str = "/scratch";
 /// Buffer between the archive encoder and storage. Large writes let libssh2
 /// pipeline many SFTP packets per round trip instead of waiting for an ack
 /// after every few kilobytes.
@@ -112,6 +118,73 @@ struct Cli {
     )]
     retention_max_total_size: u64,
 
+    /// Archive each file from a reflink copy (btrfs, XFS), so it can't change while it is read.
+    #[arg(long, env = "REFLINK", default_value = "auto")]
+    reflink: ReflinkMode,
+
+    /// Writable directory for temporary copies of files: reflinks when it's
+    /// on the volumes' filesystem and that supports them, else full copies of
+    /// files too large to read into memory.
+    #[arg(long, env = "SCRATCH_DIR", default_value = DEFAULT_SCRATCH_DIR)]
+    scratch_dir: PathBuf,
+
+    /// Free space that must remain in `SCRATCH_DIR` after copying a file, or
+    /// after a reflinked file were fully rewritten while its copy exists.
+    #[arg(
+        long,
+        env = "SCRATCH_MIN_FREE",
+        default_value = "2GiB",
+        value_parser = parse_size
+    )]
+    scratch_min_free: u64,
+
+    /// How many times a small file (see `retry_buffer_size`) that changes
+    /// while being read is read before its last copy is archived as possibly
+    /// inconsistent. 1 disables retries.
+    #[arg(long, env = "RETRY_ATTEMPTS", default_value_t = 3)]
+    retry_attempts: u32,
+
+    /// Wait before each retry pass over a volume's changed files.
+    #[arg(
+        long,
+        env = "RETRY_DELAY",
+        default_value = "5s",
+        value_parser = humantime::parse_duration
+    )]
+    retry_delay: Duration,
+
+    /// Time limit for all retries of one volume.
+    #[arg(
+        long,
+        env = "RETRY_VOLUME_BUDGET",
+        default_value = "10m",
+        value_parser = humantime::parse_duration
+    )]
+    retry_volume_budget: Duration,
+
+    /// Files up to this size that aren't reflinked are read into memory, and
+    /// larger ones are copied into `SCRATCH_DIR`. Either way a file is
+    /// archived only once a read was stable, or on the last attempt.
+    #[arg(
+        long,
+        env = "RETRY_BUFFER_SIZE",
+        default_value = "16MiB",
+        value_parser = parse_size
+    )]
+    retry_buffer_size: u64,
+
+    /// Files too large to read into memory are fully copied into
+    /// `SCRATCH_DIR` before reading only if they changed within this time.
+    /// Older ones are streamed directly, which avoids rewriting large files
+    /// that rarely change.
+    #[arg(
+        long,
+        env = "COPY_CHANGED_WITHIN",
+        default_value = "1h",
+        value_parser = humantime::parse_duration
+    )]
+    copy_changed_within: Duration,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -171,6 +244,95 @@ impl Default for Compression {
         Self {
             kind: CompressionKind::Zstd,
             level: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReflinkMode {
+    /// Reflink when `SCRATCH_DIR` is usable and the filesystem supports it.
+    Auto,
+    /// Always read the live files.
+    Off,
+}
+
+/// How a volume is read: compression, reflinks, and retries of files that
+/// change while being read.
+#[derive(Debug, Default)]
+struct BackupOptions {
+    compression: Compression,
+    scratch: Option<Scratch>,
+    reflink: bool,
+    retry: RetryPolicy,
+    /// Runs right before a file's data is read, to simulate writes that
+    /// happen during the read.
+    #[cfg(test)]
+    before_read: Option<tests::Hook>,
+}
+
+impl BackupOptions {
+    fn from_config(config: &Cli) -> Self {
+        let reflink = config.reflink == ReflinkMode::Auto;
+        let scratch = match Scratch::new(&config.scratch_dir, config.scratch_min_free) {
+            Ok(scratch) => {
+                info!(
+                    "copying files into {} before reading them{}, keeping {} free",
+                    config.scratch_dir.display(),
+                    if reflink {
+                        " (reflinks when possible)"
+                    } else {
+                        ""
+                    },
+                    format_human_size(config.scratch_min_free)
+                );
+                Some(scratch)
+            }
+            Err(error) => {
+                warn!(
+                    "{} is not usable ({error}): no reflinks, and files over {} that change \
+                     while being read are archived once and flagged",
+                    config.scratch_dir.display(),
+                    format_human_size(config.retry_buffer_size)
+                );
+                None
+            }
+        };
+        Self {
+            compression: Compression::from_config(config),
+            scratch,
+            reflink,
+            retry: RetryPolicy {
+                attempts: config.retry_attempts,
+                delay: config.retry_delay,
+                budget: config.retry_volume_budget,
+                buffer_size: config.retry_buffer_size,
+                copy_changed_within: config.copy_changed_within,
+            },
+            #[cfg(test)]
+            before_read: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    /// Total reads of a file, including the first one.
+    attempts: u32,
+    delay: Duration,
+    budget: Duration,
+    buffer_size: u64,
+    /// Large files changed within this time are copied before reading.
+    copy_changed_within: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            delay: Duration::from_secs(5),
+            budget: Duration::from_secs(600),
+            buffer_size: 16 * 1024 * 1024,
+            copy_changed_within: Duration::from_hours(1),
         }
     }
 }
@@ -488,7 +650,7 @@ fn main() -> Result<()> {
             backup_volume(
                 &cli.volumes_root,
                 storage.as_mut(),
-                Compression::from_config(&cli),
+                &BackupOptions::from_config(&cli),
                 volume,
                 None,
             )?;
@@ -514,7 +676,7 @@ fn main() -> Result<()> {
             backup_all(
                 &cli.volumes_root,
                 storage.as_mut(),
-                Compression::from_config(&cli),
+                &BackupOptions::from_config(&cli),
             )?
             .into_result("backup")?;
         }
@@ -548,6 +710,9 @@ fn validate_config(config: &Cli) -> Result<()> {
     if config.retention_min_count == 0 {
         bail!("RETENTION_MIN_COUNT must be greater than 0");
     }
+    if config.retry_attempts == 0 {
+        bail!("RETRY_ATTEMPTS must be greater than 0");
+    }
     if let Some(level) = config.compression_level {
         let valid = match config.compression {
             CompressionKind::Zstd => (1..=22).contains(&level),
@@ -566,7 +731,7 @@ fn validate_config(config: &Cli) -> Result<()> {
 fn backup_volume(
     volumes_root: &Path,
     storage: &mut dyn Storage,
-    compression: Compression,
+    options: &BackupOptions,
     volume: &str,
     progress: Option<(usize, usize)>,
 ) -> Result<ArchiveInfo> {
@@ -579,15 +744,14 @@ fn backup_volume(
     let archive = format!(
         "{}{}",
         Utc::now().format("%Y-%m-%dT%H-%M-%SZ"),
-        compression.kind.extension()
+        options.compression.kind.extension()
     );
     let partial = format!("{archive}{PARTIAL_SUFFIX}");
-    let written =
-        write_archive(storage, compression, volume, &partial, &source).and_then(|written| {
-            storage.rename(volume, &partial, &archive)?;
-            Ok(written)
-        });
-    let (size, warnings) = match written {
+    let written = write_archive(storage, options, volume, &partial, &source).and_then(|written| {
+        storage.rename(volume, &partial, &archive)?;
+        Ok(written)
+    });
+    let (size, report) = match written {
         Ok(written) => written,
         Err(error) => {
             if let Err(remove_error) = storage.remove(volume, &partial) {
@@ -600,42 +764,43 @@ fn backup_volume(
         name: archive,
         size,
     };
-    log_backup_completed(volume, &source, &archive_info, warnings, progress);
+    log_backup_completed(volume, &source, &archive_info, &report, progress);
     Ok(archive_info)
 }
 
 /// Streams `source` into a new archive and returns the compressed size and
-/// the number of source problems that were skipped with a warning.
+/// what happened to the volume's files.
 fn write_archive(
     storage: &mut dyn Storage,
-    compression: Compression,
+    options: &BackupOptions,
     volume: &str,
     name: &str,
     source: &Path,
-) -> Result<(u64, usize)> {
+) -> Result<(u64, VolumeReport)> {
+    let compression = options.compression;
     let writer = CountingWriter::new(storage.put(volume, name)?);
-    let (mut writer, warnings) = match compression.kind {
+    let (mut writer, report) = match compression.kind {
         CompressionKind::Zstd => {
             let level = i32::try_from(compression.level).context("invalid zstd level")?;
             let encoder =
                 zstd::Encoder::new(writer, level).context("failed to create zstd encoder")?;
             let mut tar = Builder::new(encoder);
-            let warnings = append_directory_contents(&mut tar, source)?;
+            let report = VolumeArchiver::new(&mut tar, source, volume, options).run()?;
             let encoder = tar.into_inner().context("failed to finish tar stream")?;
             let writer = encoder.finish().context("failed to finish zstd stream")?;
-            (writer, warnings)
+            (writer, report)
         }
         CompressionKind::Xz => {
             let encoder = XzEncoder::new(writer, compression.level);
             let mut tar = Builder::new(encoder);
-            let warnings = append_directory_contents(&mut tar, source)?;
+            let report = VolumeArchiver::new(&mut tar, source, volume, options).run()?;
             let encoder = tar.into_inner().context("failed to finish tar stream")?;
             let writer = encoder.finish().context("failed to finish xz stream")?;
-            (writer, warnings)
+            (writer, report)
         }
     };
     writer.flush().context("failed to flush archive stream")?;
-    Ok((writer.bytes_written(), warnings))
+    Ok((writer.bytes_written(), report))
 }
 
 fn restore_volume(
@@ -676,14 +841,14 @@ fn restore_volume(
 fn backup_all(
     volumes_root: &Path,
     storage: &mut dyn Storage,
-    compression: Compression,
+    options: &BackupOptions,
 ) -> Result<VolumeResults> {
     let volumes = discover_volumes(volumes_root)?;
     info!("backing up {} volume(s)", volumes.len());
     let mut results = VolumeResults::default();
     for (index, volume) in volumes.iter().enumerate() {
         let progress = (index + 1, volumes.len());
-        match backup_volume(volumes_root, storage, compression, volume, Some(progress)) {
+        match backup_volume(volumes_root, storage, options, volume, Some(progress)) {
             Ok(_) => results.succeeded.push(volume.clone()),
             Err(error) => {
                 error!(
@@ -840,7 +1005,7 @@ fn run_scheduler(config: &Cli, backup_cron: &str) -> Result<()> {
             let results = backup_all(
                 &config.volumes_root,
                 storage.as_mut(),
-                Compression::from_config(config),
+                &BackupOptions::from_config(config),
             )?;
             // Only rotate archives of volumes that just got a fresh backup, so a
             // failing volume keeps all of its older archives.
@@ -886,116 +1051,607 @@ fn retention_policy(config: &Cli) -> RetentionPolicy {
     }
 }
 
-/// Appends everything under `root` to the archive, skipping files that vanish
-/// or cannot be read with a warning instead of failing the whole backup.
-/// Returns the number of warnings. Errors are returned only when writing the
-/// archive itself fails.
-fn append_directory_contents<W: Write>(tar: &mut Builder<W>, root: &Path) -> Result<usize> {
-    let mut warnings = 0;
-
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                let path = error.path().unwrap_or(root).to_owned();
-                if is_not_found(error.io_error()) {
-                    // Deleted between listing its parent and reading it.
-                    warn!("skipping {}: removed during backup", path.display());
-                } else {
-                    warn!("skipping {}: cannot read: {error}", path.display());
-                }
-                warnings += 1;
-                continue;
-            }
-        };
-        let path = entry.path();
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-
-        let file_type = entry.file_type();
-        if file_type.is_dir() {
-            let metadata = match fs::symlink_metadata(path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    warnings += source_error(path, &error);
-                    continue;
-                }
-            };
-            let mut header = Header::new_gnu();
-            header.set_metadata_in_mode(&metadata, HeaderMode::Complete);
-            header.set_entry_type(EntryType::Directory);
-            header.set_size(0);
-            tar.append_data(&mut header, relative, io::empty())?;
-        } else if file_type.is_file() {
-            // Take the metadata from the open handle, so the header describes
-            // the exact file being read even if the path is replaced meanwhile.
-            let opened = File::open(path).and_then(|file| {
-                let metadata = file.metadata()?;
-                Ok((file, metadata))
-            });
-            let (file, metadata) = match opened {
-                Ok(opened) => opened,
-                Err(error) => {
-                    warnings += source_error(path, &error);
-                    continue;
-                }
-            };
-            if !metadata.is_file() {
-                warn!("skipping {}: no longer a regular file", path.display());
-                warnings += 1;
-                continue;
-            }
-            let mut header = Header::new_gnu();
-            header.set_metadata_in_mode(&metadata, HeaderMode::Complete);
-            let mut reader = FixedSizeReader::new(file, metadata.len());
-            // The outer BufReader makes io::copy move data in large blocks.
-            tar.append_data(
-                &mut header,
-                relative,
-                BufReader::with_capacity(READ_BUFFER_SIZE, &mut reader),
-            )?;
-            if let Some(problem) = reader.problem(&metadata) {
-                warn!("{}: {problem}", path.display());
-                warnings += 1;
-            }
-        } else if file_type.is_symlink() {
-            let target = match fs::read_link(path) {
-                Ok(target) => target,
-                Err(error) => {
-                    warnings += source_error(path, &error);
-                    continue;
-                }
-            };
-            let mut header = Header::new_gnu();
-            header.set_entry_type(EntryType::Symlink);
-            header.set_size(0);
-            header.set_mode(0o777);
-            if let Some(modified) = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-            {
-                set_header_mtime(&mut header, modified);
-            }
-            header.set_cksum();
-            tar.append_link(&mut header, relative, target)?;
-        }
-    }
-    Ok(warnings)
+/// What happened to a volume's files during a backup.
+#[derive(Debug, Default)]
+struct VolumeReport {
+    files: usize,
+    /// Files archived from a reflink copy.
+    reflinked: usize,
+    /// Reads that fully copied a file into the scratch directory.
+    copied: usize,
+    /// Files that changed while being read and were read again later.
+    retried: usize,
+    /// Files whose archived copy may be inconsistent.
+    unstable: Vec<PathBuf>,
+    /// Entries that could not be archived at all.
+    skipped: usize,
 }
 
-/// Logs a source file that cannot be archived and returns the warning count.
-fn source_error(path: &Path, error: &io::Error) -> usize {
-    if error.kind() == io::ErrorKind::NotFound {
-        warn!("skipping {}: removed during backup", path.display());
-    } else {
-        warn!("skipping {}: cannot read: {error}", path.display());
+impl VolumeReport {
+    fn warnings(&self) -> usize {
+        self.skipped + self.unstable.len()
     }
-    1
+}
+
+enum FileOutcome {
+    /// Archived from a reflink copy, or from a read during which the file
+    /// didn't change.
+    Stable,
+    /// Changed while being read. `written` tells whether that read was
+    /// archived anyway.
+    Changed { written: bool, reason: String },
+    /// Not archived: removed, unreadable, or no longer a regular file.
+    Skipped(String),
+}
+
+/// Appends one volume to the archive. Files that vanish or can't be read are
+/// skipped with a warning instead of failing the backup. Small files that
+/// change while being read are read again after the walk, and archived only
+/// once. Large streamed files can't be taken back out of the archive, so a
+/// change is only flagged. Errors are returned only when writing the archive
+/// itself fails.
+struct VolumeArchiver<'a, W: Write> {
+    tar: &'a mut Builder<W>,
+    root: &'a Path,
+    volume: &'a str,
+    retry: RetryPolicy,
+    scratch: Option<VolumeScratch<'a>>,
+    report: VolumeReport,
+    #[cfg(test)]
+    before_read: Option<&'a tests::Hook>,
+}
+
+impl<'a, W: Write> VolumeArchiver<'a, W> {
+    fn new(
+        tar: &'a mut Builder<W>,
+        root: &'a Path,
+        volume: &'a str,
+        options: &'a BackupOptions,
+    ) -> Self {
+        Self {
+            tar,
+            root,
+            volume,
+            retry: options.retry,
+            scratch: options
+                .scratch
+                .as_ref()
+                .map(|scratch| VolumeScratch::new(scratch, options.reflink)),
+            report: VolumeReport::default(),
+            #[cfg(test)]
+            before_read: options.before_read.as_ref(),
+        }
+    }
+
+    fn run(mut self) -> Result<VolumeReport> {
+        let retries_enabled = self.retry.attempts > 1;
+        let mut pending = Vec::new();
+
+        for entry in WalkDir::new(self.root)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let path = error.path().unwrap_or(self.root).to_owned();
+                    if is_not_found(error.io_error()) {
+                        // Deleted between listing its parent and reading it.
+                        warn!("skipping {}: removed during backup", path.display());
+                    } else {
+                        warn!("skipping {}: cannot read: {error}", path.display());
+                    }
+                    self.report.skipped += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(self.root) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+
+            let file_type = entry.file_type();
+            if file_type.is_dir() {
+                let metadata = match fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        self.skip(path, &describe_source_error(&error));
+                        continue;
+                    }
+                };
+                let mut header = Header::new_gnu();
+                header.set_metadata_in_mode(&metadata, HeaderMode::Complete);
+                header.set_entry_type(EntryType::Directory);
+                header.set_size(0);
+                self.tar.append_data(&mut header, relative, io::empty())?;
+            } else if file_type.is_file() {
+                self.report.files += 1;
+                match self.archive_file(path, relative, !retries_enabled)? {
+                    FileOutcome::Stable => {}
+                    FileOutcome::Changed { written, reason } if written || !retries_enabled => {
+                        self.unstable(relative, &reason);
+                    }
+                    FileOutcome::Changed { reason, .. } => {
+                        info!("{}: {reason}, will read it again", path.display());
+                        pending.push(relative.to_owned());
+                    }
+                    FileOutcome::Skipped(reason) => self.skip(path, &reason),
+                }
+            } else if file_type.is_symlink() {
+                let target = match fs::read_link(path) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        self.skip(path, &describe_source_error(&error));
+                        continue;
+                    }
+                };
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                if let Some(modified) = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                {
+                    set_header_mtime(&mut header, modified);
+                }
+                header.set_cksum();
+                self.tar.append_link(&mut header, relative, target)?;
+            }
+        }
+
+        self.retry_changed(pending)?;
+        if let Some(scratch) = &self.scratch {
+            self.report.reflinked = scratch.reflinked;
+            self.report.copied = scratch.copied;
+        }
+        Ok(self.report)
+    }
+
+    /// Reads changed files again, in passes, until each one is read without
+    /// changing or runs out of attempts, or the volume's retry budget is
+    /// used up. Nothing is archived until a read is stable or the last
+    /// attempt, except a file that has grown too big to buffer, which is
+    /// streamed once.
+    fn retry_changed(&mut self, mut pending: Vec<PathBuf>) -> Result<()> {
+        self.report.retried = pending.len();
+        let started = Instant::now();
+        let mut attempt = 1;
+        while !pending.is_empty() {
+            attempt += 1;
+            let mut out_of_budget = started.elapsed() + self.retry.delay >= self.retry.budget;
+            if !out_of_budget {
+                thread::sleep(self.retry.delay);
+            }
+            info!(
+                "volume {}: reading {} changed file(s) again, attempt {attempt} of {}",
+                self.volume,
+                pending.len(),
+                self.retry.attempts
+            );
+            for relative in std::mem::take(&mut pending) {
+                out_of_budget |= started.elapsed() >= self.retry.budget;
+                let last = attempt >= self.retry.attempts || out_of_budget;
+                let path = self.root.join(&relative);
+                match self.archive_file(&path, &relative, last)? {
+                    FileOutcome::Stable => {
+                        info!(
+                            "{}: archived unchanged on attempt {attempt}",
+                            path.display()
+                        );
+                    }
+                    FileOutcome::Changed { reason, .. } if last => {
+                        let limit = if out_of_budget {
+                            "retry budget of the volume used up"
+                        } else {
+                            "out of attempts"
+                        };
+                        self.unstable(&relative, &format!("{reason}, {limit}"));
+                    }
+                    FileOutcome::Changed {
+                        written: true,
+                        reason,
+                    } => {
+                        self.unstable(&relative, &reason);
+                    }
+                    FileOutcome::Changed { .. } => pending.push(relative),
+                    FileOutcome::Skipped(reason) => self.skip(&path, &reason),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Archives one regular file: from a reflink copy when possible, else
+    /// from memory for small files or a full copy for large ones (either
+    /// archived only once a read was stable or on the `last` attempt), else
+    /// streamed from the live file.
+    fn archive_file(&mut self, path: &Path, relative: &Path, last: bool) -> Result<FileOutcome> {
+        // Take the metadata from the open handle, so the header describes the
+        // exact file being read even if the path is replaced meanwhile.
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) => return Ok(FileOutcome::Skipped(describe_source_error(&error))),
+        };
+        let before = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return Ok(FileOutcome::Skipped(describe_source_error(&error))),
+        };
+        if !before.is_file() {
+            return Ok(FileOutcome::Skipped("no longer a regular file".to_owned()));
+        }
+
+        if before.len() > 0
+            && let Some(scratch) = &mut self.scratch
+            && let Some(copy) = scratch.reflink(&file, before.len(), path, self.volume)
+        {
+            // The copy can't change. Its size and the source's metadata right
+            // after the copy describe the archived content.
+            self.before_read(path);
+            let (Ok(source), Ok(copied)) = (file.metadata(), copy.metadata()) else {
+                return Ok(FileOutcome::Skipped("cannot stat reflink copy".to_owned()));
+            };
+            let mut header = Header::new_gnu();
+            header.set_metadata_in_mode(&source, HeaderMode::Complete);
+            header.set_size(copied.len());
+            return self.append_streamed(&copy, header, &copied, relative);
+        }
+
+        self.before_read(path);
+        if self.retry.attempts > 1 {
+            if before.len() <= self.retry.buffer_size {
+                return self.append_buffered(&file, &before, relative, last);
+            }
+            if changed_within(&before, self.retry.copy_changed_within)
+                && let Some(scratch) = &mut self.scratch
+                && let Some(copy) = scratch.copy(&file, before.len(), path, self.volume)
+            {
+                return self.append_copied(&file, &copy, &before, relative, last);
+            }
+        }
+
+        let mut header = Header::new_gnu();
+        header.set_metadata_in_mode(&before, HeaderMode::Complete);
+        self.append_streamed(&file, header, &before, relative)
+    }
+
+    /// Streams `file` into the archive; `before` is its metadata from before
+    /// the read, to detect changes.
+    fn append_streamed(
+        &mut self,
+        file: &File,
+        mut header: Header,
+        before: &fs::Metadata,
+        relative: &Path,
+    ) -> Result<FileOutcome> {
+        let mut reader = FixedSizeReader::new(file, header.size()?);
+        // The outer BufReader makes io::copy move data in large blocks.
+        self.tar.append_data(
+            &mut header,
+            relative,
+            BufReader::with_capacity(READ_BUFFER_SIZE, &mut reader),
+        )?;
+        Ok(match reader.problem(before) {
+            None => FileOutcome::Stable,
+            Some(reason) => FileOutcome::Changed {
+                written: true,
+                reason,
+            },
+        })
+    }
+
+    /// Reads a small file into memory and archives it only if it didn't
+    /// change meanwhile, or if this is the `last` attempt.
+    fn append_buffered(
+        &mut self,
+        file: &File,
+        before: &fs::Metadata,
+        relative: &Path,
+        last: bool,
+    ) -> Result<FileOutcome> {
+        let mut data = Vec::with_capacity(usize::try_from(before.len()).unwrap_or_default());
+        if let Err(error) = file.take(before.len()).read_to_end(&mut data) {
+            let reason = format!("read failed ({error})");
+            return Ok(if last {
+                FileOutcome::Skipped(reason)
+            } else {
+                FileOutcome::Changed {
+                    written: false,
+                    reason,
+                }
+            });
+        }
+        let stable = data.len() as u64 == before.len()
+            && file
+                .metadata()
+                .is_ok_and(|after| same_version(before, &after));
+        if stable || last {
+            let mut header = Header::new_gnu();
+            header.set_metadata_in_mode(before, HeaderMode::Complete);
+            header.set_size(data.len() as u64);
+            self.tar.append_data(&mut header, relative, &data[..])?;
+        }
+        Ok(if stable {
+            FileOutcome::Stable
+        } else {
+            FileOutcome::Changed {
+                written: last,
+                reason: "changed while being read".to_owned(),
+            }
+        })
+    }
+
+    /// Archives `copy`, a full copy of `file`, only if `file` didn't change
+    /// while it was copied, or if this is the `last` attempt.
+    fn append_copied(
+        &mut self,
+        file: &File,
+        copy: &File,
+        before: &fs::Metadata,
+        relative: &Path,
+        last: bool,
+    ) -> Result<FileOutcome> {
+        let Ok(copied) = copy.metadata() else {
+            return Ok(FileOutcome::Skipped("cannot stat copy".to_owned()));
+        };
+        let stable = copied.len() == before.len()
+            && file
+                .metadata()
+                .is_ok_and(|after| same_version(before, &after));
+        if stable || last {
+            let mut header = Header::new_gnu();
+            header.set_metadata_in_mode(before, HeaderMode::Complete);
+            header.set_size(copied.len());
+            self.append_streamed(copy, header, &copied, relative)?;
+        }
+        Ok(if stable {
+            FileOutcome::Stable
+        } else {
+            FileOutcome::Changed {
+                written: last,
+                reason: "changed while being copied".to_owned(),
+            }
+        })
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self, unused_variables))]
+    fn before_read(&self, path: &Path) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_read {
+            (hook.0)(path);
+        }
+    }
+
+    fn skip(&mut self, path: &Path, reason: &str) {
+        warn!("skipping {}: {reason}", path.display());
+        self.report.skipped += 1;
+    }
+
+    fn unstable(&mut self, relative: &Path, reason: &str) {
+        warn!(
+            "{}: {reason}, archived copy may be inconsistent",
+            self.root.join(relative).display()
+        );
+        self.report.unstable.push(relative.to_owned());
+    }
+}
+
+/// Whether the file's content or metadata changed within `window`.
+fn changed_within(metadata: &fs::Metadata, window: Duration) -> bool {
+    let changed = SystemTime::UNIX_EPOCH
+        + Duration::new(
+            u64::try_from(metadata.ctime()).unwrap_or_default(),
+            u32::try_from(metadata.ctime_nsec()).unwrap_or_default(),
+        );
+    SystemTime::now()
+        .duration_since(changed)
+        .map_or(true, |age| age <= window)
+}
+
+/// Whether two stats of the same file show no change in between.
+fn same_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn describe_source_error(error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::NotFound {
+        "removed during backup".to_owned()
+    } else {
+        format!("cannot read: {error}")
+    }
+}
+
+/// A writable directory for temporary copies of files that are read while
+/// they may change. On the volumes' filesystem, files are reflinked there: a
+/// reflink shares the file's data instead of copying it, takes about as long
+/// as a stat, and is atomic, so concurrent writes land either entirely before
+/// or entirely after it. Elsewhere, files too large to read into memory are
+/// fully copied, so a copy can be checked before it's archived.
+#[derive(Debug)]
+struct Scratch {
+    dir: PathBuf,
+    min_free: u64,
+}
+
+impl Scratch {
+    fn new(dir: &Path, min_free: u64) -> io::Result<Self> {
+        let scratch = Self {
+            dir: dir.to_owned(),
+            min_free,
+        };
+        // Fails unless the directory exists, is writable, and supports
+        // unnamed files.
+        scratch.temp_file()?;
+        Ok(scratch)
+    }
+
+    /// An unnamed file that disappears when it's closed, so copies never
+    /// outlive the backup, even when it crashes.
+    fn temp_file(&self) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_TMPFILE)
+            .open(&self.dir)
+    }
+
+    /// A new temporary file, or the free space if a copy of `size` bytes
+    /// would leave less than `min_free`.
+    fn temp_file_with_room(&self, size: u64) -> io::Result<Result<File, u64>> {
+        let file = self.temp_file()?;
+        let free = available_space(&file)?;
+        Ok(if free < size.saturating_add(self.min_free) {
+            Err(free)
+        } else {
+            Ok(file)
+        })
+    }
+}
+
+/// Scratch directory state of one volume.
+struct VolumeScratch<'a> {
+    scratch: &'a Scratch,
+    reflink_enabled: bool,
+    reflinked: usize,
+    copied: usize,
+    low_space_logged: bool,
+}
+
+impl<'a> VolumeScratch<'a> {
+    fn new(scratch: &'a Scratch, reflink: bool) -> Self {
+        Self {
+            scratch,
+            reflink_enabled: reflink,
+            reflinked: 0,
+            copied: 0,
+            low_space_logged: false,
+        }
+    }
+
+    /// Returns a reflink copy of `file`, or `None` when it can't be made.
+    fn reflink(&mut self, file: &File, size: u64, path: &Path, volume: &str) -> Option<File> {
+        if !self.reflink_enabled {
+            return None;
+        }
+        // A reflinked file takes no space until the original is rewritten,
+        // and then at most its size while the copy exists.
+        let result = self
+            .scratch
+            .temp_file_with_room(size)
+            .and_then(|copy| match copy {
+                Ok(copy) => reflink(file, &copy).map(|()| Ok(copy)),
+                Err(free) => Ok(Err(free)),
+            });
+        match result {
+            Ok(Ok(copy)) => {
+                self.reflinked += 1;
+                Some(copy)
+            }
+            Ok(Err(free)) => {
+                self.log_low_space(free, path, volume);
+                None
+            }
+            Err(error) if self.reflinked == 0 && is_reflink_unsupported(&error) => {
+                self.reflink_enabled = false;
+                info!("volume {volume}: reflinks not possible ({error})");
+                None
+            }
+            Err(error) => {
+                info!("{}: reflink failed ({error})", path.display());
+                None
+            }
+        }
+    }
+
+    /// Returns a full copy of the first `size` bytes of `file`, positioned
+    /// at its start, or `None` when it can't be made.
+    fn copy(&mut self, file: &File, size: u64, path: &Path, volume: &str) -> Option<File> {
+        let result = self
+            .scratch
+            .temp_file_with_room(size)
+            .and_then(|copy| match copy {
+                Ok(mut copy) => {
+                    // Uses copy_file_range, so the data doesn't pass through
+                    // this process.
+                    io::copy(&mut file.take(size), &mut copy)?;
+                    copy.rewind()?;
+                    Ok(Ok(copy))
+                }
+                Err(free) => Ok(Err(free)),
+            });
+        match result {
+            Ok(Ok(copy)) => {
+                self.copied += 1;
+                Some(copy)
+            }
+            Ok(Err(free)) => {
+                self.log_low_space(free, path, volume);
+                None
+            }
+            Err(error) => {
+                info!(
+                    "{}: copy failed ({error}), reading the live file",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    fn log_low_space(&mut self, free: u64, path: &Path, volume: &str) {
+        if !self.low_space_logged {
+            self.low_space_logged = true;
+            warn!(
+                "volume {volume}: only {} free in the scratch directory, reading files too \
+                 large to copy with SCRATCH_MIN_FREE={} left live, starting with {}",
+                format_human_size(free),
+                format_human_size(self.scratch.min_free),
+                path.display()
+            );
+        }
+    }
+}
+
+/// Errors that mean the volume can't be reflinked into `SCRATCH_DIR` at all,
+/// such as a different filesystem, rather than a problem with one file.
+fn is_reflink_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY | libc::ENOSYS)
+    )
+}
+
+fn reflink(source: &File, target: &File) -> io::Result<()> {
+    // SAFETY: both descriptors stay open for the call; FICLONE takes the
+    // source descriptor as its argument and doesn't keep it.
+    let result = unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn available_space(file: &File) -> io::Result<u64> {
+    let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: fstatvfs fills the struct when it returns 0.
+    let stat = unsafe {
+        if libc::fstatvfs(file.as_raw_fd(), stat.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        stat.assume_init()
+    };
+    // Narrower than u64 on some targets.
+    #[allow(clippy::useless_conversion)]
+    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
 }
 
 fn is_not_found(error: Option<&io::Error>) -> bool {
@@ -1025,7 +1681,7 @@ impl<R> FixedSizeReader<R> {
     }
 }
 
-impl FixedSizeReader<File> {
+impl FixedSizeReader<&File> {
     /// Describes anything that went wrong while the file was archived.
     fn problem(&self, before: &fs::Metadata) -> Option<String> {
         if let Some(error) = &self.error {
@@ -1041,9 +1697,7 @@ impl FixedSizeReader<File> {
             ));
         }
         let after = self.inner.metadata().ok()?;
-        let changed =
-            after.len() != before.len() || after.modified().ok() != before.modified().ok();
-        changed.then(|| "changed while being read, archived copy may be inconsistent".to_owned())
+        (!same_version(before, &after)).then(|| "changed while being read".to_owned())
     }
 }
 
@@ -1126,25 +1780,38 @@ fn log_backup_completed(
     volume: &str,
     source: &Path,
     archive: &ArchiveInfo,
-    warnings: usize,
+    report: &VolumeReport,
     progress: Option<(usize, usize)>,
 ) {
-    let size = if warnings == 0 {
-        format_human_size(archive.size)
-    } else {
-        format!(
-            "{}, skipped {warnings} problem(s), see warnings above",
-            format_human_size(archive.size)
-        )
-    };
+    let mut details = vec![
+        format_human_size(archive.size),
+        format!("{} file(s)", report.files),
+    ];
+    if report.reflinked > 0 {
+        details.push(format!("{} reflinked", report.reflinked));
+    }
+    if report.copied > 0 {
+        details.push(format!("{} copied before reading", report.copied));
+    }
+    if report.retried > 0 {
+        details.push(format!("{} read again after changing", report.retried));
+    }
+    if report.warnings() > 0 {
+        details.push(format!(
+            "{} possibly inconsistent, {} skipped, see warnings above",
+            report.unstable.len(),
+            report.skipped
+        ));
+    }
+    let details = details.join(", ");
     match progress {
         Some((index, total)) => info!(
-            "backed up volume {volume} ({index}/{total}) from {} to archive {} ({size})",
+            "backed up volume {volume} ({index}/{total}) from {} to archive {} ({details})",
             source.display(),
             archive.name
         ),
         None => info!(
-            "backed up volume {volume} from {} to archive {} ({size})",
+            "backed up volume {volume} from {} to archive {} ({details})",
             source.display(),
             archive.name
         ),
@@ -1414,7 +2081,7 @@ mod tests {
         fs::write(media_volume.join("state.txt"), "old media").unwrap();
 
         let mut storage = LocalStorage::new(backups_root);
-        backup_all(&volumes_root, &mut storage, Compression::default()).unwrap();
+        backup_all(&volumes_root, &mut storage, &BackupOptions::default()).unwrap();
 
         fs::write(app_volume.join("state.txt"), "new app").unwrap();
         fs::write(media_volume.join("state.txt"), "new media").unwrap();
@@ -1445,7 +2112,7 @@ mod tests {
         let archive = backup_volume(
             &volumes_root,
             &mut storage,
-            Compression::default(),
+            &BackupOptions::default(),
             "app",
             None,
         )
@@ -1469,9 +2136,12 @@ mod tests {
 
         for kind in CompressionKind::ALL {
             let mut storage = LocalStorage::new(temp.path().join(format!("backups-{kind:?}")));
-            let compression = Compression { kind, level: 1 };
+            let options = BackupOptions {
+                compression: Compression { kind, level: 1 },
+                ..BackupOptions::default()
+            };
             let archive =
-                backup_volume(&volumes_root, &mut storage, compression, "app", None).unwrap();
+                backup_volume(&volumes_root, &mut storage, &options, "app", None).unwrap();
             assert!(archive.name.ends_with(kind.extension()));
 
             fs::remove_dir_all(&app_volume).unwrap();
@@ -1649,7 +2319,7 @@ mod tests {
         backup_volume(
             &volumes_root,
             &mut storage,
-            Compression::default(),
+            &BackupOptions::default(),
             "app",
             None,
         )
@@ -1677,7 +2347,7 @@ mod tests {
             inner: LocalStorage::new(temp.path().join("backups")),
             fail_volume: "bad",
         };
-        let results = backup_all(&volumes_root, &mut storage, Compression::default()).unwrap();
+        let results = backup_all(&volumes_root, &mut storage, &BackupOptions::default()).unwrap();
         assert_eq!(results.succeeded, ["a", "c"]);
         assert_eq!(results.failed, ["bad"]);
         // The interrupted archive was cleaned up instead of looking like a backup.
@@ -1707,5 +2377,377 @@ mod tests {
             .map(|archive| archive.name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["2026-01-01T01-00-00Z.tar.zst"]);
+    }
+
+    #[derive(Clone)]
+    pub(super) struct Hook(pub(super) std::sync::Arc<dyn Fn(&Path) + Send + Sync>);
+
+    impl std::fmt::Debug for Hook {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("Hook")
+        }
+    }
+
+    const ARCHIVE: &str = "2026-01-01T00-00-00Z.tar.zst";
+
+    /// Retries without waiting; files over 1 KiB are streamed.
+    fn fast_retry(attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            attempts,
+            delay: Duration::ZERO,
+            budget: Duration::from_secs(60),
+            buffer_size: 1024,
+            copy_changed_within: Duration::MAX,
+        }
+    }
+
+    /// Runs `change` for `name` on the first `times` reads of it and counts
+    /// all reads of it.
+    fn change_during_read(
+        name: &'static str,
+        times: usize,
+        change: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> (Option<Hook>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let hook = Hook(std::sync::Arc::new(move |path: &Path| {
+            if path.file_name().is_some_and(|file| file == name) {
+                let read = counter.fetch_add(1, Ordering::SeqCst);
+                if read < times {
+                    change(path);
+                }
+            }
+        }));
+        (Some(hook), reads)
+    }
+
+    fn reads(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Backs up `<root>/volumes/app` into `<root>/backups` and returns the
+    /// report and every archive entry in order, duplicates included.
+    fn backup_app(root: &Path, options: &BackupOptions) -> (VolumeReport, Vec<(String, Vec<u8>)>) {
+        let mut storage = LocalStorage::new(root.join("backups"));
+        let (_, report) = write_archive(
+            &mut storage,
+            options,
+            "app",
+            ARCHIVE,
+            &root.join("volumes").join("app"),
+        )
+        .unwrap();
+        let reader = storage.get("app", ARCHIVE).unwrap();
+        let mut archive = Archive::new(zstd::Decoder::new(reader).unwrap());
+        let mut entries = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            entries.push((entry.path().unwrap().display().to_string(), data));
+        }
+        (report, entries)
+    }
+
+    fn copies<'a>(entries: &'a [(String, Vec<u8>)], name: &str) -> Vec<&'a [u8]> {
+        entries
+            .iter()
+            .filter(|(path, _)| path == name)
+            .map(|(_, data)| data.as_slice())
+            .collect()
+    }
+
+    fn app_volume(root: &Path, files: &[(&str, &[u8])]) -> PathBuf {
+        let app = root.join("volumes").join("app");
+        fs::create_dir_all(&app).unwrap();
+        for (name, data) in files {
+            fs::write(app.join(name), data).unwrap();
+        }
+        app
+    }
+
+    #[test]
+    fn streamed_file_that_changed_is_archived_once_and_flagged() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(
+            temp.path(),
+            &[("hot.bin", &[b'a'; 4096]), ("cold.txt", b"cold")],
+        );
+        let (before_read, read_count) = change_during_read("hot.bin", 1, |path| {
+            fs::write(path, [b'b'; 4096]).unwrap();
+        });
+        let options = BackupOptions {
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        // Bytes already streamed into the archive can't be replaced, so a
+        // second read would only add another full copy.
+        assert_eq!(reads(&read_count), 1);
+        assert_eq!((report.files, report.retried), (2, 0));
+        assert_eq!(report.unstable, [PathBuf::from("hot.bin")]);
+        assert_eq!(copies(&entries, "hot.bin").len(), 1);
+        assert_eq!(copies(&entries, "cold.txt"), [b"cold"]);
+    }
+
+    /// Options that fully copy files over 1 KiB into a scratch directory
+    /// under `root`, without reflinks.
+    fn copying(root: &Path, attempts: u32, before_read: Option<Hook>) -> BackupOptions {
+        let dir = root.join("scratch");
+        fs::create_dir(&dir).unwrap();
+        BackupOptions {
+            scratch: Some(Scratch::new(&dir, 0).unwrap()),
+            retry: fast_retry(attempts),
+            before_read,
+            ..BackupOptions::default()
+        }
+    }
+
+    #[test]
+    fn large_file_that_changed_while_copied_is_copied_again_and_archived_once() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("hot.bin", &[b'a'; 4096])]);
+        let (before_read, read_count) = change_during_read("hot.bin", 1, |path| {
+            fs::write(path, [b'b'; 4096]).unwrap();
+        });
+        let options = copying(temp.path(), 3, before_read);
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 2);
+        assert_eq!((report.retried, report.copied), (1, 2));
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
+        assert_eq!(copies(&entries, "hot.bin"), [&[b'b'; 4096][..]]);
+        // Copies are unnamed and gone once read.
+        assert_eq!(
+            fs::read_dir(temp.path().join("scratch")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn large_file_that_keeps_changing_is_archived_once_after_the_last_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("hot.bin", &[b'a'; 4096])]);
+        let (before_read, read_count) = change_during_read("hot.bin", usize::MAX, |path| {
+            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"x").unwrap();
+        });
+        let options = copying(temp.path(), 3, before_read);
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 3);
+        assert_eq!(report.unstable, [PathBuf::from("hot.bin")]);
+        assert_eq!(copies(&entries, "hot.bin").len(), 1);
+    }
+
+    #[test]
+    fn large_file_not_changed_recently_is_streamed_without_copying() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("old.bin", &[b'a'; 4096])]);
+        let mut options = copying(temp.path(), 3, None);
+        options.retry.copy_changed_within = Duration::ZERO;
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(report.copied, 0);
+        assert_eq!(copies(&entries, "old.bin"), [&[b'a'; 4096][..]]);
+    }
+
+    #[test]
+    fn file_that_grows_too_big_to_buffer_is_streamed_once_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("db", b"small")]);
+        let (before_read, read_count) = change_during_read("db", 1, |path| {
+            fs::write(path, [b'b'; 4096]).unwrap();
+        });
+        let options = BackupOptions {
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 2);
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
+        assert_eq!(copies(&entries, "db"), [&[b'b'; 4096][..]]);
+    }
+
+    #[test]
+    fn small_file_is_archived_once_after_a_stable_read() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("db.sqlite", b"version 1")]);
+        let (before_read, read_count) = change_during_read("db.sqlite", 1, |path| {
+            fs::write(path, b"version 2").unwrap();
+        });
+        let options = BackupOptions {
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 2);
+        assert_eq!(report.retried, 1);
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
+        assert_eq!(copies(&entries, "db.sqlite"), [b"version 2"]);
+    }
+
+    #[test]
+    fn file_that_keeps_changing_is_archived_after_the_last_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("log.txt", b"x")]);
+        let (before_read, read_count) = change_during_read("log.txt", usize::MAX, |path| {
+            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"x").unwrap();
+        });
+        let options = BackupOptions {
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 3);
+        assert_eq!(report.unstable, [PathBuf::from("log.txt")]);
+        assert_eq!(report.warnings(), 1);
+        // Only the last read is archived, as the buffered file never was stable.
+        assert_eq!(copies(&entries, "log.txt").len(), 1);
+    }
+
+    #[test]
+    fn retry_budget_limits_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("log.txt", b"x")]);
+        let (before_read, read_count) = change_during_read("log.txt", usize::MAX, |path| {
+            fs::write(path, b"changed").unwrap();
+        });
+        let options = BackupOptions {
+            retry: RetryPolicy {
+                budget: Duration::ZERO,
+                ..fast_retry(10)
+            },
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 2);
+        assert_eq!(report.unstable.len(), 1);
+        assert_eq!(copies(&entries, "log.txt").len(), 1);
+    }
+
+    #[test]
+    fn changed_file_removed_before_retry_is_left_out() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("db-journal", b"journal"), ("db", b"db")]);
+        let (before_read, _) = change_during_read("db-journal", 1, |path| {
+            fs::write(path, b"half-written").unwrap();
+            fs::remove_file(path).unwrap();
+        });
+        let options = BackupOptions {
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(copies(&entries, "db-journal"), Vec::<&[u8]>::new());
+        assert_eq!(copies(&entries, "db"), [b"db"]);
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
+        assert_eq!(report.skipped, 1);
+    }
+
+    #[test]
+    fn single_attempt_archives_changed_file_once() {
+        let temp = tempfile::tempdir().unwrap();
+        app_volume(temp.path(), &[("db", b"v1")]);
+        let (before_read, read_count) = change_during_read("db", usize::MAX, |path| {
+            fs::write(path, b"v2").unwrap();
+        });
+        let options = BackupOptions {
+            retry: fast_retry(1),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(reads(&read_count), 1);
+        assert_eq!(report.retried, 0);
+        assert_eq!(report.unstable, [PathBuf::from("db")]);
+        assert_eq!(copies(&entries, "db").len(), 1);
+    }
+
+    /// A directory on the same filesystem as the build, which unlike /tmp
+    /// usually supports reflinks on developer machines.
+    fn build_dir_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap()
+    }
+
+    #[test]
+    fn reflinked_copy_is_unaffected_by_writes_during_read() {
+        let temp = build_dir_tempdir();
+        app_volume(
+            temp.path(),
+            &[("big.bin", &[b'a'; 8192]), ("small", b"old")],
+        );
+        let reflink_dir = temp.path().join("reflinks");
+        fs::create_dir(&reflink_dir).unwrap();
+        let (before_read, read_count) = change_during_read("big.bin", usize::MAX, |path| {
+            fs::write(path, [b'b'; 100]).unwrap();
+        });
+        let options = BackupOptions {
+            scratch: Some(Scratch::new(&reflink_dir, 0).unwrap()),
+            reflink: true,
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        if report.reflinked == 0 {
+            eprintln!(
+                "skipping: {} does not support reflinks",
+                temp.path().display()
+            );
+            return;
+        }
+        assert_eq!(reads(&read_count), 1);
+        assert_eq!(report.reflinked, 2);
+        assert_eq!(report.retried, 0);
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
+        assert_eq!(copies(&entries, "big.bin"), [&[b'a'; 8192][..]]);
+        // Copies are unnamed and gone once read.
+        assert_eq!(fs::read_dir(&reflink_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn low_free_space_falls_back_to_live_reads_with_retries() {
+        let temp = build_dir_tempdir();
+        app_volume(temp.path(), &[("small.bin", &[b'a'; 512])]);
+        let reflink_dir = temp.path().join("reflinks");
+        fs::create_dir(&reflink_dir).unwrap();
+        let (before_read, _) = change_during_read("small.bin", 1, |path| {
+            fs::write(path, [b'b'; 512]).unwrap();
+        });
+        let options = BackupOptions {
+            scratch: Some(Scratch::new(&reflink_dir, u64::MAX / 2).unwrap()),
+            reflink: true,
+            retry: fast_retry(3),
+            before_read,
+            ..BackupOptions::default()
+        };
+
+        let (report, entries) = backup_app(temp.path(), &options);
+        assert_eq!(report.reflinked, 0);
+        assert_eq!(report.retried, 1);
+        assert_eq!(copies(&entries, "small.bin"), [&[b'b'; 512][..]]);
+    }
+
+    #[test]
+    fn missing_scratch_dir_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(Scratch::new(&temp.path().join("missing"), 0).is_err());
     }
 }
