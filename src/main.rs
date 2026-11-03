@@ -2518,7 +2518,7 @@ mod tests {
         let (report, entries) = backup_app(temp.path(), &options);
         assert_eq!(reads(&read_count), 2);
         assert_eq!((report.retried, report.copied), (1, 2));
-        assert!(report.unstable.is_empty());
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
         assert_eq!(copies(&entries, "hot.bin"), [&[b'b'; 4096][..]]);
         // Copies are unnamed and gone once read.
         assert_eq!(
@@ -2570,7 +2570,7 @@ mod tests {
 
         let (report, entries) = backup_app(temp.path(), &options);
         assert_eq!(reads(&read_count), 2);
-        assert!(report.unstable.is_empty());
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
         assert_eq!(copies(&entries, "db"), [&[b'b'; 4096][..]]);
     }
 
@@ -2590,7 +2590,7 @@ mod tests {
         let (report, entries) = backup_app(temp.path(), &options);
         assert_eq!(reads(&read_count), 2);
         assert_eq!(report.retried, 1);
-        assert!(report.unstable.is_empty());
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
         assert_eq!(copies(&entries, "db.sqlite"), [b"version 2"]);
     }
 
@@ -2653,9 +2653,9 @@ mod tests {
         };
 
         let (report, entries) = backup_app(temp.path(), &options);
-        assert!(copies(&entries, "db-journal").is_empty());
+        assert_eq!(copies(&entries, "db-journal"), Vec::<&[u8]>::new());
         assert_eq!(copies(&entries, "db"), [b"db"]);
-        assert!(report.unstable.is_empty());
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
         assert_eq!(report.skipped, 1);
     }
 
@@ -2716,7 +2716,7 @@ mod tests {
         assert_eq!(reads(&read_count), 1);
         assert_eq!(report.reflinked, 2);
         assert_eq!(report.retried, 0);
-        assert!(report.unstable.is_empty());
+        assert_eq!(report.unstable, Vec::<PathBuf>::new());
         assert_eq!(copies(&entries, "big.bin"), [&[b'a'; 8192][..]]);
         // Copies are unnamed and gone once read.
         assert_eq!(fs::read_dir(&reflink_dir).unwrap().count(), 0);
