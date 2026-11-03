@@ -211,6 +211,7 @@ dependencies = [
  "env_logger",
  "filetime",
  "humantime",
+ "libc",
  "log",
  "ssh2",
  "tar",
