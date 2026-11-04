@@ -10,19 +10,17 @@ strip = "symbols"
 
 [dependencies]
 anyhow = "1.0.102"
+bytes = "1.12.1"
 chrono = { version = "0.4.44", features = ["clock", "std"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 cron = "0.16.0"
 env_logger = "0.11.10"
-filetime = "0.2.29"
 humantime = "2.3.0"
+# Bundles the time zone database, which scratch images lack.
+jiff = { version = "0.2.24", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 libc = "0.2.186"
 log = "0.4.29"
+rustic_core = { git = "https://github.com/rustic-rs/rustic_core", rev = "b583e929a172e6a6e5e9767771c41b7f376a71c1", version = "0.13.0" }
 ssh2 = { version = "0.9.5", features = ["vendored-openssl"] }
-tar = "0.4.46"
 tempfile = "3.27.0"
-thiserror = "2.0.18"
 url = "2.5.8"
-walkdir = "2.5.0"
-xz2 = { version = "0.1.7", features = ["static"] }
-zstd = "0.14.3"
